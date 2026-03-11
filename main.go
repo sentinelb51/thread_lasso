@@ -2,45 +2,26 @@ package main
 
 import (
 	"ThreadOrchestra/config"
+	"ThreadOrchestra/process"
+	"ThreadOrchestra/scanner"
 	"fmt"
-	"time"
-
-	"github.com/mitchellh/go-ps"
 )
 
 func main() {
 
-	// Read config
 	configuration, err := config.Load()
 	if err != nil {
 		panic(err)
 	}
 
-	game := findGame(configuration)
-	fmt.Printf("Config: %+v\n", game)
-}
-
-func findGame(cfg config.Config) config.Game {
-	if len(cfg.Games) == 0 {
-		panic("No games defined in config")
+	fmt.Printf("Waiting for a gameConfig...\n")
+	gameConfig, gameProcess, err := scanner.Process(configuration)
+	if err != nil {
+		panic(err)
 	}
 
-	for {
-		processes, err := ps.Processes()
-		if err != nil {
-			panic(err)
-		}
-
-		for _, process := range processes {
-			fmt.Println(process.Executable())
-			game, found := cfg.Games[process.Executable()]
-			if found {
-				fmt.Println("Found game:", process.Executable())
-				return game
-			}
-		}
-
-		time.Sleep(1 * time.Second)
-	}
-
+	fmt.Printf("Found game: %s\nConfig: %+v\n", gameProcess.Executable(), gameConfig)
+	err = process.SetAffinity(uint32(gameProcess.Pid()), []int{0, 1, 2, 3, 4, 5, 6, 7})
+	fmt.Println(err)
+	fmt.Println("Set affinity to cores 0-7")
 }
