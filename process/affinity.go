@@ -3,6 +3,7 @@ package process
 import (
 	"ThreadOrchestra/util"
 	"fmt"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -34,4 +35,32 @@ func SetAffinity(pid uint32, cores []int) error {
 	}
 
 	return nil
+}
+
+func Affinity(pid uint32) ([]int, error) {
+
+	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open process (PID: %d): %w", pid, err)
+	}
+	defer windows.CloseHandle(handle)
+
+	var (
+		processMask uintptr
+		systemMask  uintptr
+	)
+
+	// BOOL GetProcessAffinityMask(HANDLE, PDWORD_PTR, PDWORD_PTR);
+	ret, _, err := procGetProcessAffinityMask.Call(
+		uintptr(handle),
+		uintptr(unsafe.Pointer(&processMask)),
+		uintptr(unsafe.Pointer(&systemMask)),
+	)
+
+	if ret == 0 {
+		return nil, fmt.Errorf("GetProcessAffinityMask failed: %w", err)
+	}
+
+	cores := util.BitmaskToCoreArray(processMask)
+	return cores, nil
 }
