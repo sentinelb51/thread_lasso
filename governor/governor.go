@@ -29,7 +29,7 @@ type Governor struct {
 	phases     *PhaseDetector
 	actuator   *Actuator
 	manual     *manualApplier
-	resolver   ModuleResolver
+	resolver   *ModuleIndex
 	topology   *process.Topology
 
 	// UI-driven controls. Both are read at the top of each tick so the actual
@@ -37,7 +37,8 @@ type Governor struct {
 	paused          atomic.Bool
 	revertRequested atomic.Bool
 
-	warnings []string
+	warnings          []string
+	entryPointChecked bool
 
 	// Views receives one ViewModel per tick; sends are non-blocking (a slow
 	// or absent UI never stalls the loop).
@@ -248,9 +249,7 @@ func (g *Governor) buildFacts(sample *Sample) map[thread.Key]*Facts {
 			CohortWeight:      cohorts[key],
 		}
 
-		if g.resolver != nil {
-			f.Module = g.resolver(threadSample.Win32StartAddress)
-		}
+		f.Module, f.ModuleOffset = g.resolver.Resolve(threadSample.EntryPoint())
 
 		if hottest != nil && hottest.CyclesRateLong > 0 {
 			f.CyclesShare = series.CyclesRateLong / hottest.CyclesRateLong
@@ -266,7 +265,52 @@ func (g *Governor) buildFacts(sample *Sample) map[thread.Key]*Facts {
 		facts[key] = f
 	}
 
+	// Reload the module table if addresses went unresolved this window; a
+	// protected process maps its real modules long after we attach.
+	g.resolver.Refresh()
+	g.checkEntryPoints(sample)
+
 	return facts
+}
+
+// checkEntryPoints reports, once, whether the process hides where its threads
+// started. Overwatch does: its protection clears every thread's
+// Win32StartAddress, which is the field a debugger reads and the reason the
+// module column used to be empty for everything the game itself created. The
+// kernel's own copy is not writable from user mode and normally survives, so
+// the interesting question — and what the warning answers — is whether the
+// fallback recovered anything.
+func (g *Governor) checkEntryPoints(sample *Sample) {
+	if g.entryPointChecked || len(sample.Threads) < 4 {
+		return
+	}
+	g.entryPointChecked = true
+
+	scrubbed, recovered := 0, 0
+	for i := range sample.Threads {
+		snapshot := &sample.Threads[i].ThreadSnapshot
+		if snapshot.Win32StartAddress != 0 {
+			continue
+		}
+		scrubbed++
+		if snapshot.EntryPoint() != 0 {
+			recovered++
+		}
+	}
+
+	// A handful of threads without a start address is normal; a majority means
+	// the process is deliberately hiding them.
+	if scrubbed*2 <= len(sample.Threads) {
+		return
+	}
+
+	if recovered > 0 {
+		g.warn(fmt.Sprintf("%d/%d threads report no Win32 start address; using the kernel's copy (%d recovered)",
+			scrubbed, len(sample.Threads), recovered))
+		return
+	}
+	g.warn(fmt.Sprintf("%d/%d threads have no recoverable start address; identification is behavioural only",
+		scrubbed, len(sample.Threads)))
 }
 
 // Ratio band over which two threads' rates stop counting as the same: fully
@@ -281,10 +325,11 @@ const (
 // buildCohorts weighs each thread's cohort — the group of threads it is
 // indistinguishable from. Two sources are combined:
 //
-//   - a shared Win32StartAddress, which is exact but unavailable under
-//     anti-tamper (Overwatch zeroes it, which also means the address must be
-//     skipped rather than counted: every thread shares "0", and one cohort of
-//     eighty is worse than no cohort at all);
+//   - a shared entry point, which is exact but not always available:
+//     ThreadSnapshot.EntryPoint falls back to the kernel's copy when the
+//     process scrubs Win32StartAddress, and returns 0 when even that is
+//     unusable. A zero address must be skipped rather than counted — every
+//     thread would share "0", and one cohort of eighty is worse than none;
 //   - matching behaviour, which survives that erasure.
 //
 // The behavioural half is a weighted count rather than a tally of exact
@@ -295,7 +340,7 @@ const (
 func buildCohorts(sample *Sample, tracker *Tracker) map[thread.Key]float64 {
 	byStart := make(map[uintptr]int)
 	for i := range sample.Threads {
-		if address := sample.Threads[i].Win32StartAddress; address != 0 {
+		if address := sample.Threads[i].EntryPoint(); address != 0 {
 			byStart[address]++
 		}
 	}
@@ -349,7 +394,7 @@ func buildCohorts(sample *Sample, tracker *Tracker) map[thread.Key]float64 {
 		weight := behavioural[key]
 		// A shared entry point is proof of a pool, so it is a floor on the
 		// weight rather than another graded term.
-		if start := float64(byStart[sample.Threads[i].Win32StartAddress]); start > weight {
+		if start := float64(byStart[sample.Threads[i].EntryPoint()]); start > weight {
 			weight = start
 		}
 		if weight < 1 {
@@ -401,6 +446,31 @@ func (g *Governor) applyOverrides(f *Facts) {
 	}
 }
 
+// assignOrdinals numbers the threads within each role so an unnamed thread can
+// still be referred to as "render #2" from one tick to the next. The ordering
+// is by creation time (then TID), never by cycle rate: the table is sorted by
+// rate, and a label that renumbered itself every time two workers swapped
+// places would be worse than no label at all.
+func assignOrdinals(rows []ThreadRow) {
+	order := make([]int, len(rows))
+	for i := range order {
+		order[i] = i
+	}
+	sort.Slice(order, func(a, b int) bool {
+		x, y := &rows[order[a]], &rows[order[b]]
+		if x.CreateTime != y.CreateTime {
+			return x.CreateTime < y.CreateTime
+		}
+		return x.TID < y.TID
+	})
+
+	counts := make(map[string]int, roleCount)
+	for _, i := range order {
+		counts[rows[i].Role]++
+		rows[i].Ordinal = counts[rows[i].Role]
+	}
+}
+
 func (g *Governor) publish(sample *Sample, phase Phase, facts map[thread.Key]*Facts, verdicts map[thread.Key]Verdict) {
 	view := ViewModel{
 		At:           sample.At,
@@ -428,13 +498,6 @@ func (g *Governor) publish(sample *Sample, phase Phase, facts map[thread.Key]*Fa
 		}
 		verdict := verdicts[key]
 
-		// Name is the game-set thread description (often empty). We deliberately
-		// do not fall back to the Win32 start address: Overwatch's anti-tamper
-		// zeroes it (rendering a useless "0x0"), and a raw hex entry point is
-		// noise in the identity column anyway. Unnamed threads are identified by
-		// their module (full mode) or classified role instead.
-		name := threadSample.Description
-
 		waitProfile := ""
 		if reason, share := f.Series.DominantWait(); share > 0 {
 			waitProfile = fmt.Sprintf("%s %.0f%%", reason, share*100)
@@ -446,9 +509,13 @@ func (g *Governor) publish(sample *Sample, phase Phase, facts map[thread.Key]*Fa
 		}
 
 		view.Rows = append(view.Rows, ThreadRow{
-			TID:          threadSample.TID,
-			Name:         name,
+			TID: threadSample.TID,
+			// The game-set thread description, usually empty; ThreadRow.Identity
+			// decides what to show when it is.
+			Name:         threadSample.Description,
 			Module:       f.Module,
+			ModuleOffset: f.ModuleOffset,
+			CreateTime:   threadSample.CreateTime,
 			CyclesRate:   f.Series.CyclesRateLong,
 			SwitchRate:   f.Series.SwitchRateLong,
 			Quantum:      f.Series.CyclesPerSwitch,
@@ -464,6 +531,7 @@ func (g *Governor) publish(sample *Sample, phase Phase, facts map[thread.Key]*Fa
 		})
 	}
 
+	assignOrdinals(view.Rows)
 	sort.Slice(view.Rows, func(i, j int) bool { return view.Rows[i].CyclesRate > view.Rows[j].CyclesRate })
 
 	// Non-blocking publish: drop the frame if the consumer is behind.

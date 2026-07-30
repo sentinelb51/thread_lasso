@@ -46,23 +46,13 @@ func printReport(view ViewModel) {
 	writer := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
 	// PRIO is dynamic/base: the pair is what distinguishes a thread the game
 	// elevated from one Windows is briefly boosting, and from one we promoted.
-	fmt.Fprintln(writer, "  TID\tNAME\tMODULE\tCYC/S\tSW/S\tPRIO\tWAIT\tROLE\tCONF\tBUCKET\tAPPLIED")
+	fmt.Fprintln(writer, "  TID\tTHREAD\tCYC/S\tSW/S\tPRIO\tWAIT\tROLE\tCONF\tBUCKET\tAPPLIED")
 
 	for i, row := range view.Rows {
 		if i >= reportTopRows {
 			break
 		}
 
-		module := row.Module
-		if module == "" {
-			module = "-"
-		}
-		// Fall back to the module (full mode) or a dash when the thread is
-		// unnamed, so the column is never blank.
-		name := row.Name
-		if name == "" {
-			name = module
-		}
 		applied := row.Applied
 		if applied == "" {
 			applied = "-"
@@ -72,8 +62,8 @@ func printReport(view ViewModel) {
 			flags = " *starved"
 		}
 
-		fmt.Fprintf(writer, "  %d\t%s\t%s\t%.2fM\t%.0f\t%d/%d\t%s\t%s\t%.0f%%\t%s\t%s%s\n",
-			row.TID, truncate(name, 22), truncate(module, 16),
+		fmt.Fprintf(writer, "  %d\t%s\t%.2fM\t%.0f\t%d/%d\t%s\t%s\t%.0f%%\t%s\t%s%s\n",
+			row.TID, truncate(row.Identity(), 34),
 			row.CyclesRate/1e6, row.SwitchRate, row.Priority, row.BasePriority,
 			shortWait(row.WaitProfile), row.Role, row.Confidence*100,
 			row.Bucket, applied, flags)

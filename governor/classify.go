@@ -72,17 +72,14 @@ var bucketNames = map[Bucket]string{
 
 func (b Bucket) String() string { return bucketNames[b] }
 
-// ModuleResolver maps a start address to a lowercase module base name
-// ("amdxx64.dll"). nil / empty result in limited mode.
-type ModuleResolver func(addr uintptr) string
-
 // Facts is the complete evidence about one thread for a single window.
 type Facts struct {
 	Series            *Series
 	Description       string
-	Module            string // lowercase base name; "" when unknown
-	TimeCritical      bool   // the *game* elevated this thread (see Series.BaselineRelative)
-	PriorityBoosted   bool   // the game nudged it above the process base, but not to the top
+	Module            string  // lowercase base name; "" when unknown
+	ModuleOffset      uintptr // offset of the entry point into Module
+	TimeCritical      bool    // the *game* elevated this thread (see Series.BaselineRelative)
+	PriorityBoosted   bool    // the game nudged it above the process base, but not to the top
 	IsForegroundInput bool
 	CohortWeight      float64 // how many threads look like this one (see buildCohorts)
 	CyclesShare       float64 // CyclesRateLong / hottest thread's rate

@@ -23,6 +23,11 @@ var (
 	procGetSystemCpuSetInformation       = kernel32.NewProc("GetSystemCpuSetInformation")
 	procGetLogicalProcessorInformationEx = kernel32.NewProc("GetLogicalProcessorInformationEx")
 
+	// The PSAPI entry points live in kernel32 under a "K32" prefix on Win7+;
+	// psapi.dll only forwards to them. x/sys/windows wraps most of the family
+	// but not this one.
+	procGetMappedFileNameW = kernel32.NewProc("K32GetMappedFileNameW")
+
 	ntdll                        = windows.NewLazySystemDLL("ntdll.dll")
 	procNtQueryInformationThread = ntdll.NewProc("NtQueryInformationThread")
 	procNtSetInformationThread   = ntdll.NewProc("NtSetInformationThread")

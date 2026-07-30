@@ -31,8 +31,10 @@ const (
 // derived purely from Samples — no syscalls — so the whole metrics layer is
 // unit-testable with synthetic streams.
 type Series struct {
-	Key               thread.Key
-	Win32StartAddress uintptr
+	Key thread.Key
+	// EntryPoint is the thread's start routine, or 0 when the process scrubbed
+	// it beyond recovery — see process.ThreadSnapshot.EntryPoint.
+	EntryPoint uintptr
 
 	CyclesRateShort float64 // cycles/sec
 	CyclesRateLong  float64
@@ -75,7 +77,7 @@ type Series struct {
 }
 
 func (s *Series) update(sample *ThreadSample, at time.Time, processCreateTime int64) {
-	s.Win32StartAddress = sample.Win32StartAddress
+	s.EntryPoint = sample.EntryPoint()
 	s.Lifetime = time.Duration(nowFiletimeDelta(at, sample.CreateTime))
 	s.CreatedAtStart = sample.CreateTime-processCreateTime < int64(createdAtStartWindow/100)
 

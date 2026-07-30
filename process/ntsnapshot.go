@@ -154,6 +154,33 @@ type ThreadSnapshot struct {
 	TebBase           uintptr
 }
 
+// kernelSpaceFloor is the bottom of the x64 kernel-mode half of the address
+// space. ETHREAD.StartAddress points there for system threads; for a game
+// process it never legitimately does.
+const kernelSpaceFloor = uintptr(0xFFFF800000000000)
+
+// EntryPoint is the thread's start routine, preferring the value a debugger
+// would show and falling back to the one user mode cannot rewrite.
+//
+// Win32StartAddress is ETHREAD.Win32StartAddress, which a process may overwrite
+// for its own threads through NtSetInformationThread(ThreadQuerySetWin32Start-
+// Address). Overwatch's protection does exactly that — every thread reports 0,
+// which is why the module column was empty for anything the game itself
+// created. StartAddress is the routine the kernel recorded at creation and is
+// not settable from user mode, so it survives the scrub.
+//
+// Returns 0 when neither field is a usable user-mode address; callers must
+// treat 0 as "unknown" and never group threads by it.
+func (t *ThreadSnapshot) EntryPoint() uintptr {
+	if t.Win32StartAddress != 0 && t.Win32StartAddress < kernelSpaceFloor {
+		return t.Win32StartAddress
+	}
+	if t.StartAddress != 0 && t.StartAddress < kernelSpaceFloor {
+		return t.StartAddress
+	}
+	return 0
+}
+
 // ProcessSnapshot is a single process entry from the system snapshot.
 type ProcessSnapshot struct {
 	PID            uint32

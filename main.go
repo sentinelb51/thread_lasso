@@ -11,13 +11,24 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sort"
 	"syscall"
+	"time"
 )
+
+// A game that has just exited can linger in the process list for a moment.
+// Settling before the next scan stops the supervisor from re-attaching to a
+// pid that is already tearing down.
+const rescanDelay = 2 * time.Second
+
+// The window closes before the governor has reverted its thread changes, so
+// the process waits for the supervisor to unwind. CTRL_CLOSE grants ~5s.
+const shutdownGrace = 5 * time.Second
 
 func main() {
 	// The Fyne GUI is the default. It needs CGO, so a -tags nogui build drops it;
 	// in that build, or with the -nogui flag, the text reporter consumes the same
-	// view-model stream.
+	// event stream.
 	noGUI := flag.Bool("nogui", false, "print periodic text reports instead of the GUI")
 	flag.Parse()
 
@@ -36,59 +47,131 @@ func main() {
 		fmt.Println("GUI not compiled in (this is a -tags nogui build); using text report")
 	}
 
-	for rootCtx.Err() == nil {
-		fmt.Println("Waiting for a game...")
-		game, gameProcess, err := scanner.Process(configuration)
+	// The supervisor owns the whole lifecycle — scan, attach, run, rescan — and
+	// narrates it as events. Both front ends consume the same stream, which is
+	// why "waiting for a game" is no longer a console line the GUI can't show.
+	events := make(chan ui.Event, 4)
+	supervised := make(chan struct{})
+	go func() {
+		defer close(supervised)
+		supervise(rootCtx, configuration, events)
+	}()
+
+	if !useGUI {
+		reportEvents(rootCtx, events)
+		return
+	}
+
+	if err := ui.Run(ui.Feed{
+		Events:   events,
+		Watching: watchedExecutables(configuration),
+		OnQuit:   stop,
+	}); err != nil {
+		fmt.Println("ui:", err)
+	}
+
+	// Closing the window cancelled rootCtx; the governor still has to put every
+	// tuned thread back before the process exits.
+	select {
+	case <-supervised:
+	case <-time.After(shutdownGrace):
+		fmt.Println("timed out waiting for threads to be reverted")
+	}
+}
+
+// supervise runs the scan → attach → run → rescan cycle until ctx is
+// cancelled, publishing one event per transition. It closes events on the way
+// out so the consumer knows no more sessions are coming.
+func supervise(ctx context.Context, configuration config.Config, events chan<- ui.Event) {
+	defer close(events)
+
+	for ctx.Err() == nil {
+		if !send(ctx, events, ui.Event{Status: "Waiting for a game…"}) {
+			return
+		}
+
+		game, gameProcess, err := scanner.Process(ctx, configuration)
 		if err != nil {
-			panic(err)
+			if ctx.Err() == nil {
+				send(ctx, events, ui.Event{Status: "Scan failed: " + err.Error(), Fatal: true})
+			}
+			return
 		}
 
 		name := gameProcess.Executable()
 		pid := uint32(gameProcess.Pid())
-		fmt.Printf("Found game: %s (pid %d)\n", name, pid)
 
 		if game.Auto == nil {
-			fmt.Printf("%s has no \"auto\" section configured; nothing for the governor to do.\n", name)
+			send(ctx, events, ui.Event{
+				Status: fmt.Sprintf("%s has no \"auto\" section configured; nothing for the governor to do.", name),
+				Fatal:  true,
+			})
 			return
 		}
 
-		if err := runGovernor(rootCtx, name, game, pid, useGUI); err != nil {
-			fmt.Println("governor stopped:", err)
+		g := governor.New(name, game, pid)
+		if !send(ctx, events, ui.Event{Session: g}) {
+			return
 		}
 
-		// Fyne's GL loop can only run once per process, and closing the window is
-		// the user's quit signal — re-scanning would spin up a second app and
-		// crash. Text mode is free to loop and re-attach when the game restarts.
-		if useGUI {
-			break
+		if err := g.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			if !send(ctx, events, ui.Event{Status: "Governor stopped: " + err.Error()}) {
+				return
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(rescanDelay):
 		}
 	}
 }
 
-// runGovernor drives one game session: it starts the view-model consumer and
-// runs the governor loop until the game exits or the process is interrupted.
-// useGUI is decided once by the caller (flag + build tag); re-deriving it here
-// is what silently forced every session into the text reporter.
-func runGovernor(ctx context.Context, name string, game config.Game, pid uint32, useGUI bool) error {
-	g := governor.New(name, game, pid)
-
-	sessionCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	if !useGUI {
-		go governor.Report(sessionCtx, g)
-		err := g.Run(sessionCtx)
-		if err != nil && !errors.Is(err, context.Canceled) {
-			return err
-		}
-		return nil
+// send publishes an event unless ctx is cancelled first. It reports whether the
+// event was delivered, so the caller can stop rather than push into a stream
+// nobody is reading.
+func send(ctx context.Context, events chan<- ui.Event, event ui.Event) bool {
+	select {
+	case events <- event:
+		return true
+	case <-ctx.Done():
+		return false
 	}
+}
 
-	// The Fyne loop must own the main goroutine, so the governor runs alongside
-	// it; closing the window cancels the session and unblocks the loop.
-	go func() {
-		g.Run(sessionCtx)
-		cancel()
-	}()
-	return ui.Run(g)
+// reportEvents is the -nogui consumer: it prints status transitions and runs
+// the text reporter for the duration of each session.
+func reportEvents(ctx context.Context, events <-chan ui.Event) {
+	// stopReporter always refers to the currently running reporter, so any exit
+	// path — a new event, or the stream closing — tears it down exactly once.
+	stopReporter := func() {}
+	defer func() { stopReporter() }()
+
+	for event := range events {
+		stopReporter()
+		stopReporter = func() {}
+
+		if event.Session != nil {
+			reportCtx, cancel := context.WithCancel(ctx)
+			stopReporter = cancel
+			go governor.Report(reportCtx, event.Session)
+			continue
+		}
+
+		if event.Status != "" {
+			fmt.Println(event.Status)
+		}
+	}
+}
+
+// watchedExecutables lists the configured game binaries, for the GUI to show
+// while it waits.
+func watchedExecutables(configuration config.Config) []string {
+	names := make([]string, 0, len(configuration.Games))
+	for name := range configuration.Games {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }

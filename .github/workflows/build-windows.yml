@@ -91,9 +91,9 @@ jobs:
         shell: pwsh
         run: |
           # config.json is loaded from the working directory, so it has to ship
-          # beside the binaries.
+          # beside the binaries. Nothing else does: AGENTS.md and friends are
+          # repo documentation, not part of the release.
           Copy-Item config.json dist/
-          Copy-Item AGENTS.md   dist/ -ErrorAction SilentlyContinue
 
           $name = 'ThreadOrchestra-${{ steps.version.outputs.version }}-windows-amd64.zip'
           Compress-Archive -Path dist/* -DestinationPath $name -Force
