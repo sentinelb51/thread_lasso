@@ -13,6 +13,16 @@ func Load() (config Config, err error) {
 		return
 	}
 
-	err = json.Unmarshal(data, &config)
+	if err = json.Unmarshal(data, &config); err != nil {
+		return
+	}
+
+	for name, game := range config.Games {
+		if game.Auto != nil {
+			game.Auto.applyDefaults()
+			config.Games[name] = game
+		}
+	}
+
 	return
 }
