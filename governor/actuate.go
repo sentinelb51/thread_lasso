@@ -4,6 +4,7 @@ package governor
 
 import (
 	"ThreadOrchestra/thread"
+	"sort"
 	"strings"
 	"time"
 )
@@ -54,9 +55,36 @@ type actionState struct {
 	label       string
 	bucket      Bucket // what the current settings were applied *for*
 	idealCPU    int    // sticky: the physical core this thread was steered onto
+	idealSlot   int    // index of that core in the topology's lead list
 	hasIdeal    bool
 	demoted     bool // we lowered this thread; the watchdog may roll it back
 	quarantined bool // rolled back after starvation — never touched again
+}
+
+// roleImportance orders the critical set for physical-core placement: the
+// threads whose stalls are most visible to the player get first pick of the
+// least-contended core. Roles outside the critical set never reach placement.
+var roleImportance = map[Role]int{
+	RoleMainSim:      5,
+	RoleRenderSubmit: 4,
+	RoleGPUWorker:    3,
+	RoleAudio:        2,
+	RoleInput:        1,
+}
+
+// bucketImportance ranks buckets for the same ordering. Critical threads are
+// placed before anything else claims a core.
+func bucketImportance(b Bucket) int {
+	switch b {
+	case BucketCritical:
+		return 2
+	case BucketInteractive:
+		return 1
+	case BucketBackground:
+		return 0
+	default:
+		return -1
+	}
 }
 
 // Actuator turns per-thread verdicts into thread modifications, filtered by
@@ -69,8 +97,18 @@ type Actuator struct {
 	cooldown         time.Duration
 	promotionCeiling int
 	demotionFloor    int
-	nextCore         int // round-robin cursor into the physical-core leads
+	coreLoad         []int // threads currently steered onto each physical-core lead
 	states           map[thread.Key]*actionState
+	pending          []pendingAction // reused across ticks to keep Apply allocation-free
+}
+
+// pendingAction is one thread's actuation, queued so the tick can be ordered by
+// importance before anything is applied.
+type pendingAction struct {
+	key     thread.Key
+	entry   *thread.Entry
+	verdict Verdict
+	facts   *Facts
 }
 
 func NewActuator(g *Governor) *Actuator {
@@ -96,7 +134,14 @@ func NewActuator(g *Governor) *Actuator {
 // Apply walks this tick's stable verdicts and enacts the bucket policy. Only
 // called in auto optimisation during PhaseStable, so it can assume the game is
 // in a settled state.
+//
+// Threads are ordered by importance rather than by snapshot order, because the
+// order decides who gets the least-contended physical core: the main thread
+// should not lose a dedicated core to whichever job worker happened to appear
+// first in the kernel's thread list.
 func (a *Actuator) Apply(sample *Sample, facts map[thread.Key]*Facts, verdicts map[thread.Key]Verdict) {
+	a.pending = a.pending[:0]
+
 	for i := range sample.Threads {
 		threadSample := &sample.Threads[i]
 		key := thread.Key{TID: threadSample.TID, CreateTime: threadSample.CreateTime}
@@ -108,7 +153,7 @@ func (a *Actuator) Apply(sample *Sample, facts map[thread.Key]*Facts, verdicts m
 
 		verdict, ok := verdicts[key]
 		if !ok || !verdict.Stable {
-			continue // only act on classifications that held for stable_windows
+			continue // only act on classifications the bucket filter has committed
 		}
 
 		f := facts[key]
@@ -116,7 +161,24 @@ func (a *Actuator) Apply(sample *Sample, facts map[thread.Key]*Facts, verdicts m
 			continue
 		}
 
-		a.applyOne(key, entry, verdict, f)
+		a.pending = append(a.pending, pendingAction{key, entry, verdict, f})
+	}
+
+	sort.SliceStable(a.pending, func(i, j int) bool {
+		left, right := &a.pending[i], &a.pending[j]
+		if bl, br := bucketImportance(left.verdict.Bucket), bucketImportance(right.verdict.Bucket); bl != br {
+			return bl > br
+		}
+		if rl, rr := roleImportance[left.verdict.Role], roleImportance[right.verdict.Role]; rl != rr {
+			return rl > rr
+		}
+
+		return left.facts.CyclesShare > right.facts.CyclesShare
+	})
+
+	for i := range a.pending {
+		action := &a.pending[i]
+		a.applyOne(action.key, action.entry, action.verdict, action.facts)
 	}
 }
 
@@ -146,7 +208,7 @@ func (a *Actuator) applyOne(key thread.Key, entry *thread.Entry, verdict Verdict
 
 		state.bucket = BucketNone
 		state.demoted = false
-		state.hasIdeal = false
+		a.releaseCore(state)
 
 		if tuned {
 			// Re-tune for the new bucket only after a cooldown, so a flapping
@@ -201,10 +263,17 @@ func (a *Actuator) applyOne(key thread.Key, entry *thread.Entry, verdict Verdict
 		if a.aggression == aggConservative {
 			return // raise-only mode never demotes
 		}
+		// Demotions require more evidence than promotions at every level: a
+		// wrongly demoted thread costs frames for as long as it stays demoted,
+		// while a wrongly untouched one costs nothing. Aggressive used to skip
+		// this check entirely, so the most invasive mode was also the one acting
+		// on the weakest evidence.
+		if verdict.Confidence < demoteMinConfidence {
+			return
+		}
 		if a.aggression == aggStandard {
 			// Standard demotes only the two roles we are most sure are junk.
-			if (verdict.Role != RoleTelemetry && verdict.Role != RolePoolIdle) ||
-				verdict.Confidence < demoteMinConfidence {
+			if verdict.Role != RoleTelemetry && verdict.Role != RolePoolIdle {
 				return
 			}
 		}
@@ -259,8 +328,12 @@ func (a *Actuator) applyOne(key thread.Key, entry *thread.Entry, verdict Verdict
 }
 
 // idealCoreFor returns the physical core this thread should be steered onto,
-// assigning one from the round-robin cursor on first use and reusing it
-// thereafter. Reports false when topology is unavailable (limited mode).
+// assigning one on first use and reusing it thereafter. The core is the
+// least-occupied lead, which replaces a round-robin cursor that only ever
+// advanced: cores were never given back when a thread died or was reverted, so
+// after a session's worth of thread churn the surviving critical threads could
+// all be pointed at the same physical core while the rest of the machine sat
+// idle. Reports false when topology is unavailable (limited mode).
 func (a *Actuator) idealCoreFor(state *actionState) (int, bool) {
 	if state.hasIdeal {
 		return state.idealCPU, true
@@ -273,12 +346,37 @@ func (a *Actuator) idealCoreFor(state *actionState) (int, bool) {
 	if len(leads) == 0 {
 		return 0, false
 	}
+	if len(a.coreLoad) != len(leads) {
+		a.coreLoad = make([]int, len(leads))
+	}
 
-	state.idealCPU = leads[a.nextCore%len(leads)]
+	// Ties resolve to the lowest core index, so with the importance ordering in
+	// Apply the main thread lands on the first lead every session.
+	slot := 0
+	for i, load := range a.coreLoad {
+		if load < a.coreLoad[slot] {
+			slot = i
+		}
+	}
+
+	a.coreLoad[slot]++
+	state.idealSlot = slot
+	state.idealCPU = leads[slot]
 	state.hasIdeal = true
-	a.nextCore++
 
 	return state.idealCPU, true
+}
+
+// releaseCore returns a thread's physical-core reservation to the pool.
+func (a *Actuator) releaseCore(state *actionState) {
+	if !state.hasIdeal {
+		return
+	}
+
+	state.hasIdeal = false
+	if state.idealSlot < len(a.coreLoad) && a.coreLoad[state.idealSlot] > 0 {
+		a.coreLoad[state.idealSlot]--
+	}
 }
 
 // Watchdog rolls back any demoted thread that is now CPU-starved: a background
@@ -306,6 +404,20 @@ func (a *Actuator) Watchdog(facts map[thread.Key]*Facts) {
 		state.demoted = false
 		state.quarantined = true
 		state.label = "rolled-back"
+		a.releaseCore(state)
+	}
+}
+
+// Prune drops action state for threads that no longer exist. Without it the
+// state map grew for the whole session, and — worse — dead threads went on
+// holding physical-core reservations that live threads were then steered away
+// from.
+func (a *Actuator) Prune(live map[thread.Key]*Series) {
+	for key, state := range a.states {
+		if _, ok := live[key]; !ok {
+			a.releaseCore(state)
+			delete(a.states, key)
+		}
 	}
 }
 
@@ -314,7 +426,7 @@ func (a *Actuator) Watchdog(facts map[thread.Key]*Facts) {
 // separately (by the governor's RestoreAll) before this is called.
 func (a *Actuator) Reset() {
 	a.states = make(map[thread.Key]*actionState)
-	a.nextCore = 0
+	a.coreLoad = nil
 }
 
 // AppliedLabel is the UI's "applied" column: the last action taken on a

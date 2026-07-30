@@ -60,6 +60,17 @@ two apart. Reading the live value made the governor promote a thread, read its
 own write back as the game's intent, and move the thread to `BucketUntouchable`
 — permanently locking itself out of every thread it tuned.
 
+### Hysteresis filters the bucket, not just the role
+`Classifier.Observe` keeps two streaks. The role streak drives what the UI
+reports; the **bucket** streak drives actuation, because `Actuator.Apply` only
+ever reads `Verdict.Bucket`. Filtering the role alone meant a thread whose
+evidence alternated between two roles in the same bucket (audio vs render,
+job-worker vs loader) reset its streak every window and was never actuated.
+Two asymmetries are deliberate: `overrideBucket` results (exclude/force/game
+Time Critical) commit on the first window because they are observations rather
+than inferences, and a move to a *safer* bucket (`bucketSafety`) commits in half
+`stable_windows` — undoing a demotion must be cheaper than making one.
+
 ### Wait reasons come in pairs, and WrQueue is not the only pool primitive
 `DelayExecution` (4) and `WrDelayExecution` (11) both mean "the thread called
 Sleep"; use `Series.WaitShareAny`. For thread pools, `WrQueue` (KQUEUE) is the

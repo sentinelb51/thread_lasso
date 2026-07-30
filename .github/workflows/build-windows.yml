@@ -1,0 +1,120 @@
+name: Build (Windows)
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - '.idea/**'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# One build at a time per ref: the version step reads existing tags to pick the
+# daily build counter, so concurrent runs on main would race for the same tag.
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history + tags so the version step can see today's earlier builds.
+          fetch-depth: 0
+
+      - name: Derive version
+        id: version
+        shell: pwsh
+        run: |
+          $now = (Get-Date).ToUniversalTime()
+          $base = '{0}.{1}.{2}' -f ($now.Year % 100), $now.Month, $now.Day
+
+          # Second and later builds on the same day get a fourth component
+          # (26.7.30 -> 26.7.30.2 -> 26.7.30.3) so tags stay unique.
+          $existing = @(git tag --list "v$base" "v$base.*")
+          if ($existing.Count -gt 0) {
+            $version = '{0}.{1}' -f $base, ($existing.Count + 1)
+          } else {
+            $version = $base
+          }
+
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "tag=v$version"    | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Version: $version"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          # Caches the module cache and the build cache, keyed on go.sum.
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Vet
+        run: go vet -tags nogui ./...
+
+      - name: Test
+        run: go test -tags nogui ./...
+
+      # The Fyne GUI is the default build and needs CGO plus a C toolchain.
+      # windows-latest ships mingw-w64, but fail loudly here rather than inside
+      # the linker if that ever stops being true.
+      - name: Check C toolchain
+        run: gcc --version
+
+      - name: Build (GUI)
+        env:
+          CGO_ENABLED: '1'
+          GOOS: windows
+          GOARCH: amd64
+        run: go build -trimpath -ldflags "-s -w" -o dist/ThreadOrchestra.exe .
+
+      # CGO-free console build: useful on machines without a GPU/OpenGL driver
+      # and as a smoke test that the nogui tag still compiles standalone.
+      - name: Build (console, nogui)
+        env:
+          CGO_ENABLED: '0'
+          GOOS: windows
+          GOARCH: amd64
+        run: go build -tags nogui -trimpath -ldflags "-s -w" -o dist/ThreadOrchestra-console.exe .
+
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          # config.json is loaded from the working directory, so it has to ship
+          # beside the binaries.
+          Copy-Item config.json dist/
+          Copy-Item AGENTS.md   dist/ -ErrorAction SilentlyContinue
+
+          $name = 'ThreadOrchestra-${{ steps.version.outputs.version }}-windows-amd64.zip'
+          Compress-Archive -Path dist/* -DestinationPath $name -Force
+          "archive=$name" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ThreadOrchestra-${{ steps.version.outputs.version }}-windows-amd64
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create '${{ steps.version.outputs.tag }}' `
+            '${{ steps.package.outputs.archive }}' `
+            --target '${{ github.sha }}' `
+            --title '${{ steps.version.outputs.version }}' `
+            --generate-notes

@@ -209,14 +209,78 @@ func TestCohortVetoesMainSim(t *testing.T) {
 	}, 40)
 	s.CreatedAtStart = true
 
-	alone := &Facts{Series: s, CyclesShare: 0.9, CohortSize: 1}
+	alone := &Facts{Series: s, CyclesShare: 0.9, CohortWeight: 1}
 	if role, _ := ClassifyRole(alone); role != RoleMainSim {
 		t.Fatalf("solo hot thread: role = %v, want main/sim", role)
 	}
 
-	pooled := &Facts{Series: s, CyclesShare: 0.9, CohortSize: 4}
+	pooled := &Facts{Series: s, CyclesShare: 0.9, CohortWeight: 4}
 	if role, _ := ClassifyRole(pooled); role == RoleMainSim {
 		t.Fatalf("cohort member classified main/sim; a process has one main thread")
+	}
+}
+
+// Cohort weight is an estimate, so it must dial the main/sim and job-worker
+// readings against each other rather than switching between them: a hard cut at
+// three meant one thread joining or leaving a cohort flipped the hottest thread
+// in the process into a different bucket.
+func TestPoolingIsGraded(t *testing.T) {
+	s := buildSeries(synthTick{
+		state:           process.StateWaiting,
+		wait:            process.UserRequest,
+		cyclesPerTick:   1_270_000_000,
+		switchesPerTick: 200,
+	}, 40)
+	s.CreatedAtStart = true
+
+	scoreAt := func(weight float64) (float64, float64) {
+		sheet := scoreRoles(&Facts{Series: s, CyclesShare: 0.9, CohortWeight: weight})
+		return sheet.score[RoleMainSim], sheet.score[RoleJobWorker]
+	}
+
+	// Either side of the old hard cut of three, where the scores used to swap
+	// outright: main/sim 5.5 → 0 and job-worker 0 → 4.5 in a single window.
+	mainLow, workerLow := scoreAt(2.95)
+	mainHigh, workerHigh := scoreAt(3.05)
+
+	if mainLow <= 0 || mainHigh <= 0 {
+		t.Fatalf("main/sim evidence vanished mid-band: %.2f then %.2f", mainLow, mainHigh)
+	}
+	if math.Abs(mainHigh-mainLow) > 0.5 || math.Abs(workerHigh-workerLow) > 0.5 {
+		t.Fatalf("scores jumped across the old cohort cut: main %.2f→%.2f, worker %.2f→%.2f",
+			mainLow, mainHigh, workerLow, workerHigh)
+	}
+	if mainHigh >= mainLow || workerHigh <= workerLow {
+		t.Fatalf("a larger cohort must shift evidence from main/sim to job-worker")
+	}
+}
+
+// Thread names are identifiers, and a raw substring search over one is noisy:
+// "log" inside "Logic" pushed an engine's main logic thread toward telemetry,
+// which is a demotable bucket.
+func TestNameHintsMatchWholeWords(t *testing.T) {
+	tests := []struct {
+		name  string
+		role  Role
+		score bool
+	}{
+		{"GameLogic", RoleTelemetry, false},
+		{"LogWriter", RoleTelemetry, true},
+		{"Logging", RoleTelemetry, true},
+		{"RenderThread", RoleRenderSubmit, true},
+		{"BinkAsync0", RoleAudio, true},
+		{"GPUWorker_12", RoleJobWorker, true},
+		{"NetworkTick", RoleNetwork, true},
+	}
+
+	for _, test := range tests {
+		sheet := scoreRoles(&Facts{
+			Series:      buildSeries(synthTick{state: process.StateWaiting, wait: process.UserRequest, switchesPerTick: 5}, 10),
+			Description: test.name,
+		})
+		if scored := sheet.score[test.role] > 0; scored != test.score {
+			t.Errorf("%q: %v evidence = %v, want %v", test.name, test.role, scored, test.score)
+		}
 	}
 }
 
@@ -365,16 +429,94 @@ func TestSingleSignalIsNotFullConfidence(t *testing.T) {
 // window; the hysteresis streak reset every tick and the thread was never
 // actuated. Same evidence must always produce the same winner.
 func TestRankIsDeterministic(t *testing.T) {
-	sheet := newScoreSheet()
+	var sheet scoreSheet
 	sheet.add(RoleAudio, 3)
 	sheet.add(RoleNetwork, 3)
 	sheet.add(RoleLoader, 3)
 
-	first, _ := sheet.rank()
+	first := sheet.best()
+	if first != RoleAudio {
+		t.Fatalf("best = %v, want the earliest-declared tied role", first)
+	}
 	for i := 0; i < 200; i++ {
-		if best, _ := sheet.rank(); best != first {
-			t.Fatalf("rank returned %v then %v for identical scores", first, best)
+		if best := sheet.best(); best != first {
+			t.Fatalf("best returned %v then %v for identical scores", first, best)
 		}
+	}
+}
+
+// Actuation keys off the bucket, so the stability filter has to as well. A
+// thread whose evidence alternates between two roles in the same bucket used to
+// reset its streak every window and was therefore never actuated, even though
+// every window agreed on what to do with it.
+func TestBucketStabilizesDespiteRoleFlapping(t *testing.T) {
+	c := NewClassifier(3)
+	key := thread.Key{TID: 1}
+
+	// Two facts sets that classify differently but both land in critical: an
+	// audio pump and a foreground input thread.
+	pump := &Facts{
+		Series:      buildSeries(synthTick{state: process.StateWaiting, wait: process.WrUserRequest, cyclesPerTick: 1e6, switchesPerTick: 1000}, 40),
+		CyclesShare: 0.01,
+	}
+	input := &Facts{Series: pump.Series, CyclesShare: 0.01, IsForegroundInput: true}
+
+	var v Verdict
+	for i := 0; i < 6; i++ {
+		if i%2 == 0 {
+			v = c.Observe(key, pump)
+		} else {
+			v = c.Observe(key, input)
+		}
+	}
+
+	if v.Bucket != BucketCritical {
+		t.Fatalf("bucket = %v, want critical", v.Bucket)
+	}
+	if !v.Stable {
+		t.Fatalf("bucket never stabilised while the role flapped inside it: %+v", v)
+	}
+}
+
+// Undoing a demotion must be cheaper than making one: the safer direction
+// commits in half the windows.
+func TestSaferBucketCommitsFaster(t *testing.T) {
+	c := NewClassifier(4)
+	key := thread.Key{TID: 1}
+
+	idle := &Facts{
+		Series:      buildSeries(synthTick{state: process.StateWaiting, wait: process.WrQueue, cyclesPerTick: 0, switchesPerTick: 10}, 40),
+		CyclesShare: 0.001,
+	}
+	for i := 0; i < 4; i++ {
+		c.Observe(key, idle)
+	}
+	if v := c.Observe(key, idle); v.Bucket != BucketBackground {
+		t.Fatalf("bucket = %v, want background after four agreeing windows", v.Bucket)
+	}
+
+	// Same thread now looks like the foreground input pump — critical.
+	hot := &Facts{Series: idle.Series, CyclesShare: 0.001, IsForegroundInput: true}
+	c.Observe(key, hot)
+	v := c.Observe(key, hot)
+
+	if v.Bucket != BucketCritical {
+		t.Fatalf("bucket = %v after two windows, want critical: promotions commit in half the windows", v.Bucket)
+	}
+}
+
+// Config rules and the game's own priority intent are observations, not
+// inferences, so waiting out a stability streak before honouring "never touch
+// this thread" is exactly backwards.
+func TestOverridesCommitImmediately(t *testing.T) {
+	c := NewClassifier(5)
+	key := thread.Key{TID: 1}
+
+	s := buildSeries(synthTick{state: process.StateWaiting, wait: process.WrQueue, cyclesPerTick: 0, switchesPerTick: 10}, 40)
+	v := c.Observe(key, &Facts{Series: s, CyclesShare: 0.001, Excluded: true})
+
+	if v.Bucket != BucketUntouchable || !v.Stable {
+		t.Fatalf("verdict = %+v, want a stable untouchable bucket on the first window", v)
 	}
 }
 

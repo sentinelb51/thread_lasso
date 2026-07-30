@@ -193,6 +193,7 @@ func (g *Governor) tick() error {
 
 	phase := g.phases.Update(g.tracker)
 	g.classifier.Prune(g.tracker.Series)
+	g.actuator.Prune(g.tracker.Series)
 
 	facts := g.buildFacts(&sample)
 
@@ -244,7 +245,7 @@ func (g *Governor) buildFacts(sample *Sample) map[thread.Key]*Facts {
 			TimeCritical:      series.BaselineRelative >= gameElevatedPriority,
 			PriorityBoosted:   series.BaselineRelative > 0 && series.BaselineRelative < gameElevatedPriority,
 			IsForegroundInput: sample.InputTID != 0 && threadSample.TID == sample.InputTID,
-			CohortSize:        cohorts[key],
+			CohortWeight:      cohorts[key],
 		}
 
 		if g.resolver != nil {
@@ -268,12 +269,16 @@ func (g *Governor) buildFacts(sample *Sample) map[thread.Key]*Facts {
 	return facts
 }
 
-// cohortTolerance is the ratio within which two threads' rates count as the
-// same. Worker pools run the same code on the same work items, so their
-// members track each other closely; unrelated threads rarely do.
-const cohortTolerance = 1.25
+// Ratio band over which two threads' rates stop counting as the same: fully
+// alike within cohortTolerance, unrelated at cohortCutoff. Worker pools run the
+// same code on the same work items, so their members track each other closely;
+// unrelated threads rarely do.
+const (
+	cohortTolerance = 1.25
+	cohortCutoff    = 2.5
+)
 
-// buildCohorts sizes each thread's cohort — the group of threads it is
+// buildCohorts weighs each thread's cohort — the group of threads it is
 // indistinguishable from. Two sources are combined:
 //
 //   - a shared Win32StartAddress, which is exact but unavailable under
@@ -282,8 +287,12 @@ const cohortTolerance = 1.25
 //     eighty is worse than no cohort at all);
 //   - matching behaviour, which survives that erasure.
 //
-// A thread is always in its own cohort, so the minimum size is 1.
-func buildCohorts(sample *Sample, tracker *Tracker) map[thread.Key]int {
+// The behavioural half is a weighted count rather than a tally of exact
+// matches: a hard ratio cut made the weight — and with it the main/sim versus
+// job-worker call on the hottest thread in the process — flip on a cohort
+// member drifting a few percent between windows. A thread is always fully in
+// its own cohort, so the minimum weight is 1.
+func buildCohorts(sample *Sample, tracker *Tracker) map[thread.Key]float64 {
 	byStart := make(map[uintptr]int)
 	for i := range sample.Threads {
 		if address := sample.Threads[i].Win32StartAddress; address != 0 {
@@ -307,47 +316,63 @@ func buildCohorts(sample *Sample, tracker *Tracker) map[thread.Key]int {
 		profiles = append(profiles, profile{key, wait, series.CyclesRateLong, series.SwitchRateLong})
 	}
 
-	// O(n²) over a few dozen threads per tick, and order-independent.
-	behavioural := make(map[thread.Key]int, len(profiles))
+	// Still O(n²) over a few dozen threads per tick, but each pair is now
+	// scored once and credited to both members, which is half the work of the
+	// full square and makes the result exactly symmetric by construction.
+	weights := make([]float64, len(profiles))
 	for i := range profiles {
-		size := 0
-		for j := range profiles {
-			if profiles[i].wait == profiles[j].wait &&
-				withinTolerance(profiles[i].cycles, profiles[j].cycles) &&
-				withinTolerance(profiles[i].switches, profiles[j].switches) {
-				size++
+		weights[i] = 1 // a thread is always its own cohort member
+	}
+	for i := range profiles {
+		for j := i + 1; j < len(profiles); j++ {
+			if profiles[i].wait != profiles[j].wait {
+				continue
 			}
+			similarity := rateSimilarity(profiles[i].cycles, profiles[j].cycles) *
+				rateSimilarity(profiles[i].switches, profiles[j].switches)
+			if similarity <= 0 {
+				continue
+			}
+			weights[i] += similarity
+			weights[j] += similarity
 		}
-		behavioural[profiles[i].key] = size
 	}
 
-	cohorts := make(map[thread.Key]int, len(sample.Threads))
+	behavioural := make(map[thread.Key]float64, len(profiles))
+	for i := range profiles {
+		behavioural[profiles[i].key] = weights[i]
+	}
+
+	cohorts := make(map[thread.Key]float64, len(sample.Threads))
 	for i := range sample.Threads {
 		key := thread.Key{TID: sample.Threads[i].TID, CreateTime: sample.Threads[i].CreateTime}
-		size := behavioural[key]
-		if start := byStart[sample.Threads[i].Win32StartAddress]; start > size {
-			size = start
+		weight := behavioural[key]
+		// A shared entry point is proof of a pool, so it is a floor on the
+		// weight rather than another graded term.
+		if start := float64(byStart[sample.Threads[i].Win32StartAddress]); start > weight {
+			weight = start
 		}
-		if size < 1 {
-			size = 1
+		if weight < 1 {
+			weight = 1
 		}
-		cohorts[key] = size
+		cohorts[key] = weight
 	}
 
 	return cohorts
 }
 
-// withinTolerance reports whether two rates are within cohortTolerance of each
-// other. Two idle threads (both zero) count as matching.
-func withinTolerance(a, b float64) bool {
+// rateSimilarity grades how alike two rates are: 1 within cohortTolerance of
+// each other, decaying to 0 at cohortCutoff. Two idle threads (both zero) count
+// as identical.
+func rateSimilarity(a, b float64) float64 {
 	if a <= 0 || b <= 0 {
-		return a <= 0 && b <= 0
+		return boolTo1(a <= 0 && b <= 0)
 	}
 	if a > b {
 		a, b = b, a
 	}
 
-	return b/a <= cohortTolerance
+	return 1 - ramp(b/a, cohortTolerance, cohortCutoff)
 }
 
 // applyOverrides resolves the exclude/force config rules for one thread. An
