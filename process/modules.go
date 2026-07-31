@@ -52,13 +52,28 @@ type ModuleTable struct {
 // address ranges. The snapshot is a point-in-time view: modules mapped later
 // resolve to "" until the caller reloads.
 func LoadModuleTable(pid uint32) (*ModuleTable, error) {
-	handle, err := windows.OpenProcess(
-		windows.PROCESS_QUERY_INFORMATION|windows.PROCESS_VM_READ, false, pid)
+	handle, err := openForInspection(pid)
 	if err != nil {
-		return nil, fmt.Errorf("OpenProcess(%d) for modules: %w", pid, err)
+		return nil, err
 	}
 	defer windows.CloseHandle(handle)
 
+	return loadModuleTable(handle)
+}
+
+// openForInspection opens the rights every memory-reading path needs: the
+// module sweep, the stack sweep and the TEB read all use the same handle, and
+// holding one open beats reopening the process on every reload.
+func openForInspection(pid uint32) (windows.Handle, error) {
+	handle, err := windows.OpenProcess(
+		windows.PROCESS_QUERY_INFORMATION|windows.PROCESS_VM_READ, false, pid)
+	if err != nil {
+		return 0, fmt.Errorf("OpenProcess(%d) for inspection: %w", pid, err)
+	}
+	return handle, nil
+}
+
+func loadModuleTable(handle windows.Handle) (*ModuleTable, error) {
 	table := &ModuleTable{}
 	loaderErr := table.addLoadedModules(handle)
 	// Best-effort second pass. It costs one VirtualQueryEx per region, runs off

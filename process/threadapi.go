@@ -24,9 +24,13 @@ const (
 	threadPowerThrottlingClass = 3 // ThreadPowerThrottling
 )
 
-// THREADINFOCLASS value for Nt{Query,Set}InformationThread. Undocumented but
-// stable; matches System Informer's ThreadIoPriority.
-const threadIoPriorityClass = 33
+// THREADINFOCLASS values for Nt{Query,Set}InformationThread. Undocumented but
+// stable; these match System Informer's enumeration.
+const (
+	threadStartAddressClass = 9  // ThreadQuerySetWin32StartAddress
+	threadIsIoPendingClass  = 16 // ThreadIsIoPending
+	threadIoPriorityClass   = 33 // ThreadIoPriority
+)
 
 const threadPowerThrottlingExecutionSpeed = 0x1 // THREAD_POWER_THROTTLING_EXECUTION_SPEED
 
@@ -77,6 +81,60 @@ func ThreadCycles(handle windows.Handle) (uint64, error) {
 	}
 
 	return cycles, nil
+}
+
+// ThreadStartAddress reads ETHREAD.Win32StartAddress through a thread handle.
+//
+// This is the same field SYSTEM_EXTENDED_THREAD_INFORMATION reports, but it
+// arrives by a different route: a direct query against a handle we already
+// hold, rather than the system-wide information class, which the kernel filters
+// in ways the per-handle path does not. When the two disagree, this one is
+// closer to the truth. When the process has scrubbed the field itself both
+// return 0, which is what the stack sweep in Inspector.Trace exists for.
+//
+// Requires THREAD_QUERY_INFORMATION, so it is a full-mode source only.
+func ThreadStartAddress(handle windows.Handle) (uintptr, error) {
+	var address uintptr
+
+	// NTSTATUS NtQueryInformationThread(HANDLE, THREADINFOCLASS, PVOID, ULONG, PULONG);
+	status, _, _ := procNtQueryInformationThread.Call(
+		uintptr(handle),
+		threadStartAddressClass,
+		uintptr(unsafe.Pointer(&address)),
+		unsafe.Sizeof(address),
+		0,
+	)
+
+	if status != 0 {
+		return 0, fmt.Errorf("NtQueryInformationThread(start address) failed: NTSTATUS 0x%08x", uint32(status))
+	}
+
+	return address, nil
+}
+
+// ThreadIoPending reports whether the thread currently has an I/O request
+// outstanding. Windows exposes no per-thread network counters at all, so this
+// is the closest thing to one: a thread parked in a socket receive is pending
+// I/O every time it is sampled, while a thread blocked on a lock or a queue
+// never is. Which device the I/O is against comes from the stack.
+//
+// Requires THREAD_QUERY_INFORMATION.
+func ThreadIoPending(handle windows.Handle) (bool, error) {
+	var pending uint32
+
+	status, _, _ := procNtQueryInformationThread.Call(
+		uintptr(handle),
+		threadIsIoPendingClass,
+		uintptr(unsafe.Pointer(&pending)),
+		unsafe.Sizeof(pending),
+		0,
+	)
+
+	if status != 0 {
+		return false, fmt.Errorf("NtQueryInformationThread(io pending) failed: NTSTATUS 0x%08x", uint32(status))
+	}
+
+	return pending != 0, nil
 }
 
 // ThreadPriorityOf returns the thread's base priority relative to the process

@@ -32,9 +32,6 @@ const (
 // unit-testable with synthetic streams.
 type Series struct {
 	Key thread.Key
-	// EntryPoint is the thread's start routine, or 0 when the process scrubbed
-	// it beyond recovery — see process.ThreadSnapshot.EntryPoint.
-	EntryPoint uintptr
 
 	CyclesRateShort float64 // cycles/sec
 	CyclesRateLong  float64
@@ -44,9 +41,14 @@ type Series struct {
 	UserRatio       float64 // user/(user+kernel) time, EMA
 	ReadyRatio      float64 // EMA of "observed in Ready state" = CPU starvation
 	RunningRatio    float64
-	Lifetime        time.Duration
-	CreatedAtStart  bool
-	Samples         int
+	// IoPendingRatio is the EMA of "observed with an I/O request outstanding".
+	// A thread parked in a socket receive or an overlapped file read sits at
+	// nearly 1; a thread blocked on a lock or a job queue sits at 0. Full mode
+	// only — the query needs THREAD_QUERY_INFORMATION.
+	IoPendingRatio float64
+	Lifetime       time.Duration
+	CreatedAtStart bool
+	Samples        int
 
 	// BaselineRelative is the thread's priority relative to the process base,
 	// captured the first time we ever saw the thread — before the governor
@@ -77,7 +79,6 @@ type Series struct {
 }
 
 func (s *Series) update(sample *ThreadSample, at time.Time, processCreateTime int64) {
-	s.EntryPoint = sample.EntryPoint()
 	s.Lifetime = time.Duration(nowFiletimeDelta(at, sample.CreateTime))
 	s.CreatedAtStart = sample.CreateTime-processCreateTime < int64(createdAtStartWindow/100)
 
@@ -118,6 +119,9 @@ func (s *Series) update(sample *ThreadSample, at time.Time, processCreateTime in
 
 	s.ReadyRatio = ema(s.ReadyRatio, boolTo1(sample.ThreadState == process.StateReady), longAlpha)
 	s.RunningRatio = ema(s.RunningRatio, boolTo1(sample.ThreadState == process.StateRunning), longAlpha)
+	if sample.HasIoPending {
+		s.IoPendingRatio = ema(s.IoPendingRatio, boolTo1(sample.IoPending), longAlpha)
+	}
 
 	for i := range s.waitHistogram {
 		s.waitHistogram[i] *= waitDecay

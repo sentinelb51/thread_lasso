@@ -3,9 +3,12 @@
 package governor
 
 import (
+	"ThreadOrchestra/config"
 	"ThreadOrchestra/process"
 	"ThreadOrchestra/thread"
+	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"unicode"
 )
@@ -74,16 +77,32 @@ func (b Bucket) String() string { return bucketNames[b] }
 
 // Facts is the complete evidence about one thread for a single window.
 type Facts struct {
-	Series            *Series
-	Description       string
-	Module            string  // lowercase base name; "" when unknown
-	ModuleOffset      uintptr // offset of the entry point into Module
-	TimeCritical      bool    // the *game* elevated this thread (see Series.BaselineRelative)
-	PriorityBoosted   bool    // the game nudged it above the process base, but not to the top
+	Series       *Series
+	Description  string
+	Module       string  // lowercase base name of the entry point's module; "" when unknown
+	ModuleOffset uintptr // offset of the entry point into Module
+
+	// Stack holds the modules with frames on the thread's stack, most frames
+	// first. Where a thread *started* is a fact about how it was created; what
+	// is on its stack is a fact about what it does, and for a pool worker handed
+	// graphics or socket work the second is the only useful one.
+	Stack []string
+
+	// GUIThread is set when the thread has a TEB.Win32ThreadInfo block, i.e. has
+	// called into user32/gdi32 at least once.
+	GUIThread bool
+
+	TimeCritical      bool // the *game* elevated this thread (see Series.BaselineRelative)
+	PriorityBoosted   bool // the game nudged it above the process base, but not to the top
 	IsForegroundInput bool
 	CohortWeight      float64 // how many threads look like this one (see buildCohorts)
 	CyclesShare       float64 // CyclesRateLong / hottest thread's rate
 	FrameCorrelation  float64 // vs the hottest game thread; 0 for the hottest itself
+
+	// Signals are the thresholds this window is judged against, resolved by the
+	// governor from the config. Nil falls back to the standard preset, which is
+	// what keeps ClassifyRole usable from tests and one-shot tools.
+	Signals *config.Signals
 
 	// Config overrides, resolved by the governor from the auto.exclude and
 	// auto.force rules before classification is bucketed.
@@ -91,53 +110,46 @@ type Facts struct {
 	ForcedBucket Bucket // a force rule pins the bucket; BucketNone = not forced
 }
 
-// Classification thresholds. Cycle-rate numbers assume multi-GHz cores;
-// they separate "parked" from "doing real work", not exact CPU percentages.
-const (
-	// Absolute cycle-rate landmarks. On a ~4.5 GHz core these are roughly
-	// 0.02% and 1% of one core: below parked a thread is doing nothing at all,
-	// above active it is working continuously.
-	parkedCyclesRate = 1e6
-	activeCyclesRate = 5e7
+// fallbackSignals is what an unconfigured Facts is scored against. Every
+// threshold the classifier reads now lives in config.Signals; this exists so
+// that a Facts built by hand — a test, the probe — still scores the same way
+// the governor would score it.
+var fallbackSignals = config.DefaultTuning(config.AggressionStandard).Signals
 
-	// A pool member below this wake rate is idling between jobs rather than
-	// servicing a queue.
-	poolIdleSwitchRate = 100
+// signals resolves the thresholds for one window.
+func (f *Facts) signals() *config.Signals {
+	if f.Signals != nil {
+		return f.Signals
+	}
 
-	pumpSwitchRate = 300 // wakes/sec typical of audio/net/input pumps
-	pumpMaxQuantum = 3e4 // cycles per wake for a pump
-	regularWakeCV  = 0.5
-	burstyWakeCV   = 1.5
-	minScore       = 2.0 // below this the thread stays Unknown/untouched
-
-	// Share of waits spent on a parking primitive above which that primitive
-	// is the dominant story for the thread.
-	poolWaitShare = 0.5
-
-	// Cohort weight band over which a thread is treated as a worker-pool member
-	// rather than a role a process only has one of. Graded like every other
-	// rule: a hard cut at three meant one thread joining or leaving a cohort
-	// flipped the hottest thread in the process between main/sim and job-worker,
-	// and with it between two different buckets.
-	poolCohortLo = 1.5
-	poolCohortHi = 3.5
-
-	// Thread priority relative to the process base at or above which the game
-	// is deliberately prioritising the thread. Note this is inherently
-	// ambiguous on Windows: in a dynamic priority class,
-	// THREAD_PRIORITY_TIME_CRITICAL and THREAD_PRIORITY_HIGHEST both land a
-	// HIGH-class thread on base priority 15. Both mean "the game wants this
-	// thread scheduled", which is all the bucket policy needs.
-	gameElevatedPriority = 2
-)
-
-var gpuDriverModules = []string{
-	"amdxx64", "atidxx64", "nvwgf2umx", "nvd3dumx", "nvoglv64", "igd10iumd64", "igd12umd64",
+	return &fallbackSignals
 }
 
-var audioModules = []string{"bink", "xaudio", "mmdevapi", "audioses", "wasapi"}
+// Module names that identify a subsystem. They are matched as substrings of a
+// lowercase base name, so "d3d11" catches d3d11.dll and d3d11on12.dll alike.
+var (
+	gpuDriverModules = []string{
+		"amdxx64", "atidxx64", "nvwgf2umx", "nvd3dumx", "nvoglv64", "igd10iumd64", "igd12umd64",
+	}
 
-var networkModules = []string{"vivoxsdk", "mswsock", "ws2_32", "winhttp", "wininet"}
+	// The D3D/DXGI runtime itself, as opposed to the vendor driver below it.
+	graphicsModules = []string{"dxgi", "d3d9", "d3d11", "d3d12", "d3dcompiler", "dcomp", "dxcore"}
+
+	// win32u is the syscall stub layer for the graphics kernel. Frames from it
+	// underneath dxgi are a present or a command submission on its way to
+	// dxgkrnl — which is to say, this thread is the one handing finished frames
+	// to the display.
+	graphicsKernelModules = []string{"win32u", "gdi32"}
+
+	audioModules = []string{"bink", "xaudio", "mmdevapi", "audioses", "wasapi", "avrt", "fmod", "wwise"}
+
+	networkModules = []string{
+		"vivoxsdk", "mswsock", "ws2_32", "winhttp", "wininet",
+		"dnsapi", "iphlpapi", "nsi.dll", "fwpuclnt", "rasadhlp",
+	}
+
+	inputModules = []string{"xinput", "dinput8", "hid.dll", "gameinput"}
+)
 
 // nameHints maps thread-name tokens (from SetThreadDescription) to roles.
 // Matching is per token with prefix semantics rather than a substring search of
@@ -183,6 +195,10 @@ var nameHints = []struct {
 type scoreSheet struct {
 	score [roleCount]float64
 	hits  [roleCount]int
+
+	// minScore travels with the sheet because winner and confidence are read
+	// after scoring, by callers that no longer have the Facts to hand.
+	minScore float64
 }
 
 // add records points for a role. Graded rules routinely evaluate to zero, and
@@ -208,10 +224,10 @@ func (sheet *scoreSheet) best() Role {
 	return best
 }
 
-// winner is the top-ranked role once it clears minScore.
+// winner is the top-ranked role once it clears the minimum score.
 func (sheet *scoreSheet) winner() Role {
 	best := sheet.best()
-	if best == RoleUnknown || sheet.score[best] < minScore {
+	if best == RoleUnknown || sheet.score[best] < sheet.minScore {
 		return RoleUnknown
 	}
 
@@ -226,14 +242,14 @@ func (sheet *scoreSheet) confidence(role Role) float64 {
 	}
 
 	best := sheet.score[role]
-	if best < minScore {
+	if best < sheet.minScore {
 		return 0
 	}
 
 	// The runner-up is floored: an unopposed signal is not certainty, it is
 	// just the only thing that fired. Without the floor, the *least* informed
 	// classifications were the ones reporting 100%.
-	rival := minScore / 2
+	rival := sheet.minScore / 2
 	for other := Role(1); int(other) < roleCount; other++ {
 		if other != role && sheet.score[other] > rival {
 			rival = sheet.score[other]
@@ -252,6 +268,8 @@ func (sheet *scoreSheet) confidence(role Role) float64 {
 // threshold. Pure function.
 func scoreRoles(f *Facts) scoreSheet {
 	var sheet scoreSheet
+	sig := f.signals()
+	sheet.minScore = sig.MinScore
 	s := f.Series
 
 	// EMAs and the wait histogram carry no signal in the first windows; a
@@ -270,11 +288,11 @@ func scoreRoles(f *Facts) scoreSheet {
 	// cohort weight is itself an estimate, so it dials the single-instance and
 	// pool readings of the same evidence against each other rather than
 	// switching between them.
-	pooled := ramp(f.CohortWeight, poolCohortLo, poolCohortHi)
+	pooled := ramp(f.CohortWeight, sig.PoolCohortLo, sig.PoolCohortHi)
 	solo := 1 - pooled
 
 	// Hot crunchers: the top cycle consumers are the frame-critical set.
-	hot := ramp(f.CyclesShare, 0.30, 0.60)
+	hot := ramp(f.CyclesShare, sig.HotShareLo, sig.HotShareHi)
 	sheet.add(RoleJobWorker, 2*pooled*hot)
 	sheet.add(RoleMainSim, 3*solo*hot)
 	if s.CreatedAtStart {
@@ -283,31 +301,34 @@ func scoreRoles(f *Facts) scoreSheet {
 
 	// Long uninterrupted work quanta at a high absolute rate: simulation or
 	// heavy worker code, as opposed to a pump doing a sliver of work per wake.
-	cruncher := math.Min(ramp(s.CyclesRateLong, 2e8, 1e9), ramp(s.CyclesPerSwitch, 2e5, 1e6))
+	cruncher := math.Min(
+		ramp(s.CyclesRateLong, sig.CruncherRateLo, sig.CruncherRateHi),
+		ramp(s.CyclesPerSwitch, sig.CruncherQuantumLo, sig.CruncherQuantumHi),
+	)
 	sheet.add(RoleJobWorker, 1.5*pooled*cruncher)
 	sheet.add(RoleMainSim, 1.5*solo*cruncher)
 
 	// Render submit: a large share of the cycles delivered in many small wakes.
 	// Both conditions must hold, so the weaker of the two ramps governs.
 	sheet.add(RoleRenderSubmit, 2.5*math.Min(
-		ramp(f.CyclesShare, 0.15, 0.35),
-		ramp(s.SwitchRateLong, 1000, 3000),
+		ramp(f.CyclesShare, sig.RenderShareLo, sig.RenderShareHi),
+		ramp(s.SwitchRateLong, sig.RenderSwitchLo, sig.RenderSwitchHi),
 	))
 
 	// Frame-coupled activity marks render/sim helpers even without modules.
 	// At poll-interval granularity this is a load-envelope correlation, not
 	// true frame coupling, so it nudges rather than decides.
-	coupled := ramp(f.FrameCorrelation, 0.6, 0.9)
+	coupled := ramp(f.FrameCorrelation, sig.FrameCorrelationLo, sig.FrameCorrelationHi)
 	sheet.add(RoleRenderSubmit, 2*coupled)
 	sheet.add(RoleMainSim, 1*coupled)
 
 	// Pumps: many tiny wakes. The game marking a pump Time Critical is a
 	// strong audio signal (see TID 11068 in the captures).
-	isPump := s.SwitchRateLong > pumpSwitchRate && s.CyclesPerSwitch > 0 && s.CyclesPerSwitch < pumpMaxQuantum
+	isPump := s.SwitchRateLong > sig.PumpSwitchRate && s.CyclesPerSwitch > 0 && s.CyclesPerSwitch < sig.PumpMaxQuantum
 	if isPump {
 		sheet.add(RoleAudio, 2)
 		sheet.add(RoleNetwork, 1.5)
-		if s.WakeRegularity() < regularWakeCV {
+		if s.WakeRegularity() < sig.RegularWakeCV {
 			sheet.add(RoleAudio, 1)
 		}
 		if f.TimeCritical {
@@ -328,11 +349,11 @@ func scoreRoles(f *Facts) scoreSheet {
 	// contended lock waits there too, and coverage discounts a dominant reason
 	// that rests on very few observations.
 	parked := (s.WaitShare(process.WrQueue) + 0.75*s.WaitShare(process.WrAlertByThreadId)) * s.WaitCoverage()
-	if parked > poolWaitShare {
+	if parked > sig.PoolWaitShare {
 		switch {
-		case s.CyclesRateLong < parkedCyclesRate:
+		case s.CyclesRateLong < sig.ParkedCyclesRate:
 			sheet.add(RolePoolIdle, 4*parked)
-		case s.CyclesRateLong < activeCyclesRate && s.SwitchRateLong < poolIdleSwitchRate:
+		case s.CyclesRateLong < sig.ActiveCyclesRate && s.SwitchRateLong < sig.PoolIdleSwitchRate:
 			sheet.add(RolePoolIdle, 3*parked)
 		default:
 			sheet.add(RoleJobWorker, 4*parked)
@@ -348,26 +369,37 @@ func scoreRoles(f *Facts) scoreSheet {
 	// DelayExecution for a user-mode Sleep and WrDelayExecution for the waiting
 	// variant; checking only the latter missed every Sleep-looping thread.
 	sleeping := s.WaitShareAny(process.DelayExecution, process.WrDelayExecution) * s.WaitCoverage()
-	if sleeping > poolWaitShare && s.Lifetime.Seconds() > 60 {
-		sheet.add(RoleTelemetry, 3*sleeping*(1-ramp(f.CyclesShare, 0.005, 0.05)))
+	if sleeping > sig.PoolWaitShare && s.Lifetime.Seconds() > sig.TelemetryMinLifetimeS {
+		sheet.add(RoleTelemetry, 3*sleeping*(1-ramp(f.CyclesShare, sig.TelemetryShareLo, sig.TelemetryShareHi)))
 	}
 
 	// Parked regardless of wait reason.
-	if s.SwitchRateLong < 1 && s.CyclesRateLong < parkedCyclesRate {
+	if s.SwitchRateLong < 1 && s.CyclesRateLong < sig.ParkedCyclesRate {
 		sheet.add(RolePoolIdle, 2.5)
 	}
 
 	// Bursty, kernel-heavy, mid-activity: streaming/asset loading.
-	if s.WakeRegularity() > burstyWakeCV && s.UserRatio < 0.5 &&
-		f.CyclesShare > 0.02 && f.CyclesShare < 0.3 {
+	if s.WakeRegularity() > sig.BurstyWakeCV && s.UserRatio < 0.5 &&
+		f.CyclesShare > sig.LoaderShareLo && f.CyclesShare < sig.LoaderShareHi {
 		sheet.add(RoleLoader, 1.5)
 	}
 
-	// Module evidence (full mode only).
+	// Display cadence: a thread waking at a steady rate inside the plausible
+	// refresh band, while carrying real work, is running on the swapchain rather
+	// than on work arriving. Audio pumps are metronomic too, which is why this
+	// needs the cycle share — a mixer's wake is a few microseconds of work, a
+	// present is a frame's worth.
+	if s.SwitchRateLong > sig.CadenceLo && s.SwitchRateLong < sig.CadenceHi &&
+		s.WakeRegularity() < sig.CadenceCV {
+		sheet.add(RoleRenderSubmit, 2*ramp(f.CyclesShare, sig.CadenceShareLo, sig.CadenceShareHi))
+	}
+
+	// Entry-point module evidence (full mode only): what the thread was created
+	// to do.
 	if f.Module != "" {
 		switch {
 		case matchesAny(f.Module, gpuDriverModules):
-			if f.CyclesShare > 0.15 || s.SwitchRateLong > 5000 {
+			if f.CyclesShare > sig.GPUDriverShare || s.SwitchRateLong > sig.GPUDriverSwitchRate {
 				sheet.add(RoleGPUWorker, 4)
 			} else {
 				sheet.add(RolePoolIdle, 2) // parked driver pool (shader compilers)
@@ -381,10 +413,79 @@ func scoreRoles(f *Facts) scoreSheet {
 		}
 	}
 
+	scoreStack(&sheet, f)
+
+	// Pending I/O says the thread is waiting on a device rather than on the
+	// process; the stack says which device. Windows has no per-thread network
+	// counters at all, so this pairing is the closest thing to one.
+	if s.IoPendingRatio > sig.IoPendingShare {
+		if stackHas(f.Stack, networkModules) {
+			sheet.add(RoleNetwork, 2)
+		} else {
+			sheet.add(RoleLoader, 1)
+		}
+	}
+
+	// A thread with a Win32 thread info block has called into user32 or gdi32.
+	// On its own that is weak — plenty of threads touch a window once — so it
+	// only nudges, and only when the thread is also cheap enough to be a pump.
+	if f.GUIThread && f.CyclesShare < sig.GuiPumpMaxShare {
+		sheet.add(RoleInput, 1.5)
+	}
+
 	// Thread-name evidence.
 	scoreName(&sheet, f.Description)
 
 	return sheet
+}
+
+// scoreStack folds the thread's stack fingerprint into the sheet.
+//
+// This is the only evidence that survives a process hiding where its threads
+// started, and it answers a better question anyway: a job worker currently
+// inside the D3D runtime is doing render work no matter which pool created it.
+// Frames left behind by earlier calls count too — nothing rewrites the stack
+// below the current frame — so a parked thread still shows the subsystem it was
+// last inside, which is what makes the signal usable at a 1.5s poll interval.
+func scoreStack(sheet *scoreSheet, f *Facts) {
+	if len(f.Stack) == 0 {
+		return
+	}
+
+	// Driver over runtime: a thread down in the vendor UMD is doing the GPU's
+	// work, while one that only reaches the runtime is submitting to it.
+	switch {
+	case stackHas(f.Stack, gpuDriverModules):
+		sheet.add(RoleGPUWorker, 4)
+	case stackHas(f.Stack, graphicsModules):
+		sheet.add(RoleRenderSubmit, 3.5)
+	}
+
+	// The flip path: the runtime above the graphics-kernel stubs.
+	if stackHas(f.Stack, graphicsModules) && stackHas(f.Stack, graphicsKernelModules) {
+		sheet.add(RoleRenderSubmit, 2)
+	}
+
+	if stackHas(f.Stack, audioModules) {
+		sheet.add(RoleAudio, 4)
+	}
+	if stackHas(f.Stack, networkModules) {
+		sheet.add(RoleNetwork, 4)
+	}
+	if stackHas(f.Stack, inputModules) {
+		sheet.add(RoleInput, 3)
+	}
+}
+
+// stackHas reports whether any module on the stack matches one of the names.
+func stackHas(stack []string, names []string) bool {
+	for _, module := range stack {
+		if matchesAny(module, names) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // scoreName folds thread-name evidence into the sheet. Each hint fires at most
@@ -525,28 +626,89 @@ func overrideBucket(f *Facts) (Bucket, bool) {
 	return BucketNone, false
 }
 
-// bucketForRole maps a role to its tuning bucket, ignoring overrides.
-func bucketForRole(role Role) Bucket {
-	switch role {
-	case RoleMainSim, RoleRenderSubmit, RoleGPUWorker, RoleAudio, RoleInput:
-		return BucketCritical
-	case RoleNetwork, RoleJobWorker, RoleLoader:
-		return BucketInteractive
-	case RolePoolIdle, RoleTelemetry:
-		return BucketBackground
-	default:
+// RoleBuckets is the role → bucket policy: which tuning treatment each
+// classified role receives. Configurable per game through auto.role_buckets.
+type RoleBuckets [roleCount]Bucket
+
+// DefaultRoleBuckets is the policy used when the config says nothing.
+//
+// Audio and network sit below the frame-critical set on purpose. Both are
+// latency-sensitive rather than throughput-sensitive: a mixer or a socket pump
+// wakes often and does almost nothing per wake, so it gains nothing from a
+// dedicated physical core and an elevated priority, while the simulation and
+// render threads it was competing with lose one. Demoting them is a real
+// trade-off — a netcode thread that wakes late delays every packet behind it —
+// so both are one step down rather than at the bottom, and the whole table can
+// be overridden per game.
+func DefaultRoleBuckets() RoleBuckets {
+	var buckets RoleBuckets
+
+	buckets[RoleUnknown] = BucketNone
+	buckets[RoleMainSim] = BucketCritical
+	buckets[RoleRenderSubmit] = BucketCritical
+	buckets[RoleGPUWorker] = BucketCritical
+	buckets[RoleInput] = BucketCritical
+	buckets[RoleAudio] = BucketInteractive
+	buckets[RoleJobWorker] = BucketInteractive
+	buckets[RoleLoader] = BucketInteractive
+	buckets[RoleNetwork] = BucketBackground
+	buckets[RolePoolIdle] = BucketBackground
+	buckets[RoleTelemetry] = BucketBackground
+
+	return buckets
+}
+
+// ParseRoleBuckets applies config overrides to the default policy, returning
+// the resolved table and a message for every entry it could not use. Unknown
+// role or bucket names are reported rather than ignored: a typo in a policy
+// override is silent misconfiguration otherwise.
+func ParseRoleBuckets(overrides map[string]string) (RoleBuckets, []string) {
+	buckets := DefaultRoleBuckets()
+	if len(overrides) == 0 {
+		return buckets, nil
+	}
+
+	byName := make(map[string]Role, roleCount)
+	for role, name := range roleNames {
+		byName[name] = role
+	}
+
+	var problems []string
+	for name, bucketName := range overrides {
+		role, ok := byName[name]
+		if !ok || role == RoleUnknown {
+			problems = append(problems, fmt.Sprintf("role_buckets: no such role %q; ignored", name))
+			continue
+		}
+		bucket := parseBucket(bucketName)
+		if bucket == BucketNone {
+			problems = append(problems, fmt.Sprintf("role_buckets[%s]: no such bucket %q; ignored", name, bucketName))
+			continue
+		}
+		buckets[role] = bucket
+	}
+	sort.Strings(problems) // map iteration order must not reorder the warnings
+
+	return buckets, problems
+}
+
+// Of maps a role to its tuning bucket, ignoring overrides.
+func (p RoleBuckets) Of(role Role) Bucket {
+	if int(role) >= roleCount {
 		return BucketNone
 	}
+
+	return p[role]
 }
 
 // BucketFor is the full bucket decision for one window: overrides first, then
 // the role mapping. See overrideBucket.
-func BucketFor(role Role, f *Facts) Bucket {
+func (p RoleBuckets) BucketFor(role Role, f *Facts) Bucket {
 	if bucket, ok := overrideBucket(f); ok {
 		return bucket
 	}
 
-	return bucketForRole(role)
+	return p.Of(role)
 }
 
 // bucketSafety orders buckets by how safe it is for a thread to sit in one.
@@ -601,13 +763,31 @@ type roleState struct {
 // scoring so a briefly-spiking thread doesn't flap between buckets.
 type Classifier struct {
 	stableWindows int
+	saferFactor   float64
+	buckets       RoleBuckets
 	states        map[thread.Key]*roleState
 }
 
-func NewClassifier(stableWindows int) *Classifier {
-	return &Classifier{
-		stableWindows: stableWindows,
-		states:        make(map[thread.Key]*roleState),
+func NewClassifier(gates config.Gates, buckets RoleBuckets) *Classifier {
+	c := &Classifier{
+		buckets: buckets,
+		states:  make(map[thread.Key]*roleState),
+	}
+	c.Retune(gates)
+
+	return c
+}
+
+// Retune adopts new hysteresis settings without discarding what has already
+// been observed. Per-thread streaks are kept deliberately: a settings change
+// should take effect on the next window, not restart every thread's evidence
+// from nothing.
+func (c *Classifier) Retune(gates config.Gates) {
+	c.stableWindows = max(gates.StableWindows, 1)
+
+	c.saferFactor = gates.SaferBucketFactor
+	if c.saferFactor <= 0 || c.saferFactor > 1 {
+		c.saferFactor = 1
 	}
 }
 
@@ -642,7 +822,7 @@ func (c *Classifier) Observe(key thread.Key, f *Facts) Verdict {
 
 	bucket, forced := overrideBucket(f)
 	if !forced {
-		bucket = bucketForRole(role)
+		bucket = c.buckets.Of(role)
 	}
 	c.observeBucket(state, bucket, forced)
 
@@ -684,15 +864,15 @@ func (c *Classifier) observeBucket(state *roleState, bucket Bucket, forced bool)
 }
 
 // windowsToCommit is how long a bucket change must hold before it is enacted.
-// Asymmetric on purpose: a move to a safer bucket commits in half the windows,
-// so undoing a demotion that turned out to be wrong is twice as fast as making
-// one. See bucketSafety.
+// Asymmetric on purpose: a move to a safer bucket commits in a fraction of the
+// windows, so undoing a demotion that turned out to be wrong is cheaper than
+// making one. See bucketSafety and gates.safer_bucket_factor.
 func (c *Classifier) windowsToCommit(from, to Bucket) int {
-	if bucketSafety(to) > bucketSafety(from) {
-		return (c.stableWindows + 1) / 2
+	if bucketSafety(to) <= bucketSafety(from) {
+		return c.stableWindows
 	}
 
-	return c.stableWindows
+	return max(int(math.Ceil(float64(c.stableWindows)*c.saferFactor)), 1)
 }
 
 // Prune drops hysteresis state for threads no longer tracked.

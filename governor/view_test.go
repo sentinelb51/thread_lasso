@@ -21,6 +21,11 @@ func TestThreadRowIdentity(t *testing.T) {
 			want: "overwatch.exe+0x2678fa0",
 		},
 		{
+			name: "what the stack says when the origin was scrubbed",
+			row:  ThreadRow{Activity: "dxgi.dll", Role: "render", Ordinal: 2},
+			want: "[dxgi.dll]",
+		},
+		{
 			name: "synthetic label when nothing resolved",
 			row:  ThreadRow{Role: "render", Ordinal: 2},
 			want: "render #2",
@@ -41,6 +46,29 @@ func TestThreadRowIdentity(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			if got := test.row.Identity(); got != test.want {
 				t.Errorf("Identity() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+// "This thread has ntdll frames" is true of every thread in the process, so it
+// must not displace the role label that at least tells two of them apart.
+func TestActivityOfSkipsTheFramesEveryThreadHas(t *testing.T) {
+	tests := []struct {
+		name  string
+		stack []string
+		want  string
+	}{
+		{"the busiest meaningful module wins", []string{"dxgi.dll", "ntdll.dll"}, "dxgi.dll"},
+		{"startup modules are skipped over", []string{"ntdll.dll", "kernel32.dll", "ws2_32.dll"}, "ws2_32.dll"},
+		{"nothing but startup modules identifies nothing", []string{"ntdll.dll", "kernelbase.dll"}, ""},
+		{"an unswept stack", nil, ""},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := activityOf(test.stack); got != test.want {
+				t.Errorf("activityOf(%v) = %q, want %q", test.stack, got, test.want)
 			}
 		})
 	}

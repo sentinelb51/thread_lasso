@@ -195,6 +195,11 @@ func (w *waitScreen) set(status string, fatal bool) {
 type dashboard struct {
 	content *fyne.Container
 
+	// The header is shared by both tabs, so the game, phase and warnings stay
+	// visible while settings are being edited — the two are read together.
+	tabs     *container.AppTabs
+	settings *settingsPanel
+
 	title  *canvas.Text
 	status *widget.Label
 	table  *widget.Table
@@ -303,8 +308,21 @@ func newDashboard() *dashboard {
 		container.NewHBox(d.hidden, showAll),
 	)
 
-	d.content = container.NewBorder(header, controls, nil, nil, d.table)
+	d.settings = newSettingsPanel()
+	d.tabs = container.NewAppTabs(
+		container.NewTabItem("Threads", container.NewBorder(nil, controls, nil, nil, d.table)),
+		container.NewTabItem("Settings", d.settings.content),
+	)
+
+	d.content = container.NewBorder(header, nil, nil, nil, d.tabs)
 	return d
+}
+
+// showingThreads reports whether the table is the visible tab. Repainting it
+// three times a second while someone is reading the settings is work nobody can
+// see.
+func (d *dashboard) showingThreads() bool {
+	return d.tabs == nil || d.tabs.SelectedIndex() == 0
 }
 
 // attach points the dashboard at a new session and clears the previous one's
@@ -313,12 +331,15 @@ func (d *dashboard) attach(g *governor.Governor) {
 	d.session.Store(g)
 	d.pause.SetText("Pause tuning")
 	d.view = governor.ViewModel{}
+	d.settings.attach(g)
+	d.tabs.SelectIndex(0)
 	d.rebuild()
 }
 
 func (d *dashboard) detach() {
 	d.session.Store(nil)
 	d.view = governor.ViewModel{}
+	d.settings.detach()
 	d.rebuild()
 }
 
@@ -338,7 +359,9 @@ func (d *dashboard) repaint(view *governor.ViewModel) {
 // rebuild regenerates the render state from d.view. It must run on the Fyne
 // loop goroutine — from a widget callback or inside fyne.Do.
 func (d *dashboard) rebuild() {
-	d.rows = buildRows(d.view.Rows, d.all)
+	if d.showingThreads() {
+		d.rows = buildRows(d.view.Rows, d.all)
+	}
 
 	d.title.Text = titleText(d.view)
 	d.title.Refresh()
@@ -371,8 +394,10 @@ func (d *dashboard) rebuild() {
 		}
 	}
 
-	d.hidden.SetText(hiddenText(d.view, countThreads(d.rows)))
-	d.table.Refresh()
+	if d.showingThreads() {
+		d.hidden.SetText(hiddenText(d.view, countThreads(d.rows)))
+		d.table.Refresh()
+	}
 }
 
 // applyCell paints one table cell. Colour resolution lives here rather than in

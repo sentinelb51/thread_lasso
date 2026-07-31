@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -29,13 +30,21 @@ type Governor struct {
 	phases     *PhaseDetector
 	actuator   *Actuator
 	manual     *manualApplier
-	resolver   *ModuleIndex
+	identifier *Identifier
 	topology   *process.Topology
 
-	// UI-driven controls. Both are read at the top of each tick so the actual
+	// UI-driven controls. All are read at the top of each tick so the actual
 	// thread work always happens on the loop goroutine, never the UI's.
 	paused          atomic.Bool
 	revertRequested atomic.Bool
+
+	// tuning is swapped wholesale rather than edited in place, so a tick always
+	// sees one coherent table. generation increments with every swap, which is
+	// what tells the actuator that a thread's current settings were applied
+	// under rules that no longer exist and must be undone before it re-tunes.
+	tuning     atomic.Pointer[config.Tuning]
+	generation atomic.Uint64
+	saveTuning func(config.Tuning) error
 
 	warnings          []string
 	entryPointChecked bool
@@ -56,6 +65,8 @@ func New(gameName string, game config.Game, pid uint32) *Governor {
 		mode = process.AccessLimited
 	}
 
+	buckets, problems := ParseRoleBuckets(auto.RoleBuckets)
+
 	g := &Governor{
 		gameName:   gameName,
 		game:       game,
@@ -63,12 +74,21 @@ func New(gameName string, game config.Game, pid uint32) *Governor {
 		pid:        pid,
 		sampler:    NewSampler(pid, mode),
 		tracker:    NewTracker(),
-		classifier: NewClassifier(auto.StableWindows),
+		classifier: NewClassifier(auto.Tuning.Gates, buckets),
 		phases:     NewPhaseDetector(),
 		manual:     newManualApplier(game.Threads),
 		Views:      make(chan ViewModel, 1),
 	}
+	g.tuning.Store(&auto.Tuning)
 	g.actuator = NewActuator(g)
+
+	for _, problem := range problems {
+		g.warn(problem)
+	}
+	preset := config.DefaultTuning(auto.Aggression)
+	for _, problem := range checkPolicy(&auto.Tuning, &preset, buckets) {
+		g.warn(problem)
+	}
 
 	// Topology is process-wide and needs no handle, so it is loaded in every
 	// mode: it validates the assumed CPU-set base and enables SMT-aware
@@ -86,15 +106,50 @@ func New(gameName string, game config.Game, pid uint32) *Governor {
 	}
 
 	if mode == process.AccessFull {
-		resolver, err := NewModuleResolver(pid)
+		identifier, err := NewIdentifier(pid, auto.Tuning.Scan)
 		if err != nil {
-			g.warn(fmt.Sprintf("full mode: module resolution unavailable (%v), falling back to behavioral classification", err))
+			g.warn(fmt.Sprintf("full mode: process memory unreadable (%v); identification is behavioural only", err))
 		} else {
-			g.resolver = resolver
+			g.identifier = identifier
 		}
 	}
 
 	return g
+}
+
+// checkPolicy reports edits that cannot do anything. A fully configurable
+// policy has one quiet failure mode: a bucket told to lower a thread does
+// nothing at all unless that thread's role is also on the demote list, and the
+// two settings live in different sections of the config. Someone who lowers the
+// interactive bucket at standard aggression deserves to be told that the
+// preset's demote list contains no role that lands there.
+//
+// Only deviations from the preset are reported. The presets themselves contain
+// this combination on purpose — standard puts network threads in a bucket that
+// lowers priority while declining to demote them, which is precisely how
+// "demote only what I am sure about" is expressed — and warning about the
+// defaults would train everyone to ignore the warning.
+func checkPolicy(tuning, preset *config.Tuning, buckets RoleBuckets) []string {
+	var problems []string
+
+	for role := Role(1); int(role) < roleCount; role++ {
+		name := role.String()
+		bucket := buckets.Of(role)
+
+		action, ok := tuning.ActionFor(bucket.String(), name)
+		if !ok || !action.Lowers() || tuning.Gates.Demotable(name) {
+			continue
+		}
+		if shipped, ok := preset.ActionFor(bucket.String(), name); ok && shipped == action {
+			continue // as designed, not as edited
+		}
+
+		problems = append(problems, fmt.Sprintf(
+			"%s threads land in the %s bucket, which now lowers settings, but %q is not in gates.demote_roles — they will be left alone",
+			name, bucket, name))
+	}
+
+	return problems
 }
 
 // validCores drops config core indices outside the machine's logical CPU range
@@ -127,6 +182,61 @@ func (g *Governor) TogglePause() bool {
 // Paused reports whether actuation is currently suspended.
 func (g *Governor) Paused() bool { return g.paused.Load() }
 
+// Tuning returns the live tuning table and the revision it belongs to. The
+// table must be treated as read-only: it is shared by every goroutine that
+// reads it, and edits go through ApplyTuning instead.
+func (g *Governor) Tuning() (*config.Tuning, uint64) {
+	return g.tuning.Load(), g.generation.Load()
+}
+
+// Aggression is the preset name the tuning defaults come from, which is what a
+// "reset to default" is measured against.
+func (g *Governor) Aggression() string { return g.auto.Aggression }
+
+// GameName is the executable this session is attached to, and the key its
+// settings are saved under.
+func (g *Governor) GameName() string { return g.gameName }
+
+// Draft returns an editable copy of the live table together with the registry
+// bound to it. Editing the copy changes nothing until it is handed back to
+// ApplyTuning, so a settings panel can be cancelled.
+func (g *Governor) Draft() (*config.Tuning, []config.Setting) {
+	live, _ := g.Tuning()
+	draft := *live
+	defaults := config.DefaultTuning(g.auto.Aggression)
+
+	return &draft, config.Settings(&draft, &defaults)
+}
+
+// ApplyTuning swaps in an edited table and bumps the revision, which makes the
+// actuator undo settings applied under the old one before re-tuning. Safe to
+// call from the UI goroutine; the work lands on the next tick.
+func (g *Governor) ApplyTuning(tuning config.Tuning) []string {
+	problems := tuning.Validate(g.auto.Aggression)
+
+	g.tuning.Store(&tuning)
+	g.generation.Add(1)
+	g.classifier.Retune(tuning.Gates)
+
+	return problems
+}
+
+// OnSave installs the hook that writes a tuning table back to config.json. Set
+// by main, which is the only layer that knows the whole file.
+func (g *Governor) OnSave(save func(config.Tuning) error) { g.saveTuning = save }
+
+// SaveTuning applies a table and persists it. Applying happens first: a
+// settings change the user can see working is worth more than one that only
+// reached the disk.
+func (g *Governor) SaveTuning(tuning config.Tuning) ([]string, error) {
+	problems := g.ApplyTuning(tuning)
+	if g.saveTuning == nil {
+		return problems, errors.New("no config file is attached to this session")
+	}
+
+	return problems, g.saveTuning(tuning)
+}
+
 // RevertAll requests that every tuned thread be restored on the next tick. The
 // restore runs on the loop goroutine, so it never races an in-flight Apply.
 func (g *Governor) RevertAll() { g.revertRequested.Store(true) }
@@ -142,11 +252,12 @@ func (g *Governor) Run(ctx context.Context) error {
 			fmt.Printf("reverted %d threads (%d errors)\n", restored, len(errs))
 		}
 		g.sampler.Cache().Close()
+		g.identifier.Close()
 	}()
 
-	interval := time.Duration(g.auto.PollIntervalMS) * time.Millisecond
+	interval := g.pollInterval()
 	if interval < 250*time.Millisecond {
-		g.warn("poll_interval_ms below 250 is wasteful: each tick walks a full system snapshot")
+		g.warn("gates.poll_interval_ms below 250 is wasteful: each tick walks a full system snapshot")
 	}
 
 	ticker := time.NewTicker(interval)
@@ -160,12 +271,31 @@ func (g *Governor) Run(ctx context.Context) error {
 			return err
 		}
 
+		// The poll interval is itself a setting, so it can move mid-session.
+		if next := g.pollInterval(); next != interval {
+			interval = next
+			ticker.Reset(interval)
+		}
+
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
 		}
 	}
+}
+
+// pollInterval reads the configured sample period, floored so that a bad value
+// can never spin the loop.
+func (g *Governor) pollInterval() time.Duration {
+	tuning, _ := g.Tuning()
+
+	interval := time.Duration(tuning.Gates.PollIntervalMS) * time.Millisecond
+	if interval < 50*time.Millisecond {
+		interval = 50 * time.Millisecond
+	}
+
+	return interval
 }
 
 func (g *Governor) tick() error {
@@ -195,6 +325,7 @@ func (g *Governor) tick() error {
 	phase := g.phases.Update(g.tracker)
 	g.classifier.Prune(g.tracker.Series)
 	g.actuator.Prune(g.tracker.Series)
+	g.identifier.Prune(g.tracker.Series)
 
 	facts := g.buildFacts(&sample)
 
@@ -226,7 +357,21 @@ func (g *Governor) tick() error {
 // buildFacts derives the per-thread evidence set for this window.
 func (g *Governor) buildFacts(sample *Sample) map[thread.Key]*Facts {
 	hottest := g.tracker.HottestGameThread()
-	cohorts := buildCohorts(sample, g.tracker)
+	tuning, _ := g.Tuning()
+	elevated := tuning.Signals.GameElevatedPriority
+
+	// Identities are resolved first because cohort detection groups on the
+	// recovered entry point, which may have come from a stack sweep rather than
+	// from the snapshot the cohort builder can see.
+	g.identifier.BeginTick(tuning.Scan)
+	identities := make(map[thread.Key]identity, len(sample.Threads))
+	for i := range sample.Threads {
+		threadSample := &sample.Threads[i]
+		key := thread.Key{TID: threadSample.TID, CreateTime: threadSample.CreateTime}
+		identities[key] = g.identifier.Identify(key, threadSample)
+	}
+
+	cohorts := buildCohorts(sample, g.tracker, identities)
 
 	facts := make(map[thread.Key]*Facts, len(sample.Threads))
 	for i := range sample.Threads {
@@ -238,18 +383,22 @@ func (g *Governor) buildFacts(sample *Sample) map[thread.Key]*Facts {
 			continue
 		}
 
+		known := identities[key]
 		f := &Facts{
-			Series:      series,
-			Description: threadSample.Description,
+			Series:       series,
+			Description:  threadSample.Description,
+			Module:       known.Module,
+			ModuleOffset: known.ModuleOffset,
+			Stack:        known.Stack,
+			GUIThread:    known.GUI,
+			Signals:      &tuning.Signals,
 			// Both read the baseline captured at the thread's first sighting,
 			// never the live priority — see Series.BaselineRelative.
-			TimeCritical:      series.BaselineRelative >= gameElevatedPriority,
-			PriorityBoosted:   series.BaselineRelative > 0 && series.BaselineRelative < gameElevatedPriority,
+			TimeCritical:      series.BaselineRelative >= elevated,
+			PriorityBoosted:   series.BaselineRelative > 0 && series.BaselineRelative < elevated,
 			IsForegroundInput: sample.InputTID != 0 && threadSample.TID == sample.InputTID,
 			CohortWeight:      cohorts[key],
 		}
-
-		f.Module, f.ModuleOffset = g.resolver.Resolve(threadSample.EntryPoint())
 
 		if hottest != nil && hottest.CyclesRateLong > 0 {
 			f.CyclesShare = series.CyclesRateLong / hottest.CyclesRateLong
@@ -267,50 +416,101 @@ func (g *Governor) buildFacts(sample *Sample) map[thread.Key]*Facts {
 
 	// Reload the module table if addresses went unresolved this window; a
 	// protected process maps its real modules long after we attach.
-	g.resolver.Refresh()
-	g.checkEntryPoints(sample)
+	g.identifier.Refresh()
+	g.checkEntryPoints(sample, identities)
 
 	return facts
 }
 
-// checkEntryPoints reports, once, whether the process hides where its threads
-// started. Overwatch does: its protection clears every thread's
-// Win32StartAddress, which is the field a debugger reads and the reason the
-// module column used to be empty for everything the game itself created. The
-// kernel's own copy is not writable from user mode and normally survives, so
-// the interesting question — and what the warning answers — is whether the
-// fallback recovered anything.
-func (g *Governor) checkEntryPoints(sample *Sample) {
-	if g.entryPointChecked || len(sample.Threads) < 4 {
+// entryCheckTick is when the start-address diagnostic runs. Stack sweeps are
+// budgeted per tick, so the recovery routes need several ticks to have been
+// tried on every thread; reporting before then would blame the process for work
+// we had not done yet.
+const entryCheckTick = 10
+
+// checkEntryPoints reports, once, what the process is hiding about where its
+// threads started, and which of the four recovery routes still worked.
+//
+// The distinction the warning draws is the diagnostically useful one. If the
+// snapshot's stack and TEB pointers are populated while both address fields are
+// zero, the struct is being read correctly and those two fields specifically
+// have been cleared — user mode can do that to Win32StartAddress on its own,
+// but clearing the kernel's copy as well takes a driver. If the whole struct
+// comes back empty, nothing was scrubbed and we are simply not being told, so
+// the fix is privilege, not cleverness.
+func (g *Governor) checkEntryPoints(sample *Sample, identities map[thread.Key]identity) {
+	if g.entryPointChecked || sample.Tick < entryCheckTick || len(sample.Threads) < 4 {
 		return
 	}
 	g.entryPointChecked = true
 
-	scrubbed, recovered := 0, 0
+	total := len(sample.Threads)
+	blank, opaque := 0, 0
 	for i := range sample.Threads {
 		snapshot := &sample.Threads[i].ThreadSnapshot
-		if snapshot.Win32StartAddress != 0 {
+		if snapshot.EntryPoint() != 0 {
 			continue
 		}
-		scrubbed++
-		if snapshot.EntryPoint() != 0 {
-			recovered++
+		blank++
+		// Same struct, adjacent fields: if these are empty too, the snapshot
+		// itself is being withheld rather than doctored.
+		if snapshot.StackBase == 0 && snapshot.TebBase == 0 {
+			opaque++
 		}
 	}
 
-	// A handful of threads without a start address is normal; a majority means
-	// the process is deliberately hiding them.
-	if scrubbed*2 <= len(sample.Threads) {
+	// A handful of threads without a start address is normal — system worker
+	// threads have kernel-space ones. A majority means something is hiding them.
+	if blank*2 <= total {
 		return
 	}
 
-	if recovered > 0 {
-		g.warn(fmt.Sprintf("%d/%d threads report no Win32 start address; using the kernel's copy (%d recovered)",
-			scrubbed, len(sample.Threads), recovered))
-		return
+	if opaque*2 > total {
+		g.warn(fmt.Sprintf("%d/%d threads report no start address and no stack either: "+
+			"the kernel is withholding the whole thread record, not the process hiding it", opaque, total))
+	} else {
+		g.warn(fmt.Sprintf("%d/%d threads have both start-address fields cleared "+
+			"(stack and TEB pointers intact, so the record itself is readable)", blank, total))
 	}
-	g.warn(fmt.Sprintf("%d/%d threads have no recoverable start address; identification is behavioural only",
-		scrubbed, len(sample.Threads)))
+
+	g.warn("thread origins: " + describeSources(g.identifier.Sources(), total))
+}
+
+// activityOf picks the module a thread's stack says it is working in: the one
+// with the most frames that is not a module every thread has. A row reading
+// "[ntdll.dll]" would be true of the whole process and would crowd out the
+// synthetic role label, which at least distinguishes one thread from another.
+func activityOf(stack []string) string {
+	for _, module := range stack {
+		if !process.StartupModule(module) {
+			return module
+		}
+	}
+
+	return ""
+}
+
+// describeSources renders the recovery-route census, best route first, so the
+// warning says what actually worked rather than only what failed.
+func describeSources(counts map[EntrySource]int, total int) string {
+	if len(counts) == 0 {
+		return "unavailable (limited mode)"
+	}
+
+	parts := make([]string, 0, len(counts))
+	for _, source := range []EntrySource{EntryWin32, EntryKernel, EntryQuery, EntryStack} {
+		if counts[source] > 0 {
+			parts = append(parts, fmt.Sprintf("%d via %s", counts[source], source))
+		}
+	}
+	if counts[EntryNone] > 0 {
+		parts = append(parts, fmt.Sprintf("%d unrecovered", counts[EntryNone]))
+	}
+	if len(parts) == 0 {
+		return fmt.Sprintf("none of %d recovered", total)
+	}
+
+	return strings.Join(parts, ", ")
 }
 
 // Ratio band over which two threads' rates stop counting as the same: fully
@@ -325,11 +525,12 @@ const (
 // buildCohorts weighs each thread's cohort — the group of threads it is
 // indistinguishable from. Two sources are combined:
 //
-//   - a shared entry point, which is exact but not always available:
-//     ThreadSnapshot.EntryPoint falls back to the kernel's copy when the
-//     process scrubs Win32StartAddress, and returns 0 when even that is
-//     unusable. A zero address must be skipped rather than counted — every
-//     thread would share "0", and one cohort of eighty is worse than none;
+//   - a shared entry point, which is exact but not always available. The
+//     address is whatever Identifier managed to recover, which on a process
+//     that scrubs both snapshot fields means the one read off the thread's own
+//     startup frames. It is 0 when every route failed, and a zero address must
+//     be skipped rather than counted — every thread would share "0", and one
+//     cohort of eighty is worse than none;
 //   - matching behaviour, which survives that erasure.
 //
 // The behavioural half is a weighted count rather than a tally of exact
@@ -337,11 +538,11 @@ const (
 // job-worker call on the hottest thread in the process — flip on a cohort
 // member drifting a few percent between windows. A thread is always fully in
 // its own cohort, so the minimum weight is 1.
-func buildCohorts(sample *Sample, tracker *Tracker) map[thread.Key]float64 {
+func buildCohorts(sample *Sample, tracker *Tracker, identities map[thread.Key]identity) map[thread.Key]float64 {
 	byStart := make(map[uintptr]int)
-	for i := range sample.Threads {
-		if address := sample.Threads[i].EntryPoint(); address != 0 {
-			byStart[address]++
+	for _, known := range identities {
+		if known.Entry != 0 {
+			byStart[known.Entry]++
 		}
 	}
 
@@ -394,8 +595,10 @@ func buildCohorts(sample *Sample, tracker *Tracker) map[thread.Key]float64 {
 		weight := behavioural[key]
 		// A shared entry point is proof of a pool, so it is a floor on the
 		// weight rather than another graded term.
-		if start := float64(byStart[sample.Threads[i].EntryPoint()]); start > weight {
-			weight = start
+		if entry := identities[key].Entry; entry != 0 {
+			if start := float64(byStart[entry]); start > weight {
+				weight = start
+			}
 		}
 		if weight < 1 {
 			weight = 1
@@ -508,6 +711,8 @@ func (g *Governor) publish(sample *Sample, phase Phase, facts map[thread.Key]*Fa
 			applied = g.manual.AppliedLabel(key)
 		}
 
+		activity := activityOf(f.Stack)
+
 		view.Rows = append(view.Rows, ThreadRow{
 			TID: threadSample.TID,
 			// The game-set thread description, usually empty; ThreadRow.Identity
@@ -515,6 +720,7 @@ func (g *Governor) publish(sample *Sample, phase Phase, facts map[thread.Key]*Fa
 			Name:         threadSample.Description,
 			Module:       f.Module,
 			ModuleOffset: f.ModuleOffset,
+			Activity:     activity,
 			CreateTime:   threadSample.CreateTime,
 			CyclesRate:   f.Series.CyclesRateLong,
 			SwitchRate:   f.Series.SwitchRateLong,

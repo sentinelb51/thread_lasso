@@ -14,6 +14,7 @@ type ThreadRow struct {
 	Name         string  // game-set thread description; "" when unnamed
 	Module       string  // "" in limited mode, or when the entry point is unresolvable
 	ModuleOffset uintptr // offset of the entry point into Module
+	Activity     string  // module with the most frames on the thread's stack; "" when unswept
 	Ordinal      int     // 1-based, stable index among the threads sharing this role
 	CreateTime   int64   // FILETIME ticks; orders the synthetic role labels
 	CyclesRate   float64
@@ -37,8 +38,10 @@ type ThreadRow struct {
 //  2. the module and offset that own the entry point, the same thing a debugger
 //     shows ("overwatch.exe+0x2678fa0"). Every thread of a worker pool shares
 //     one, which makes it the handle to write an auto.force rule against;
-//  3. a synthetic label from the classified role, so a thread whose entry point
-//     was scrubbed is still something you can refer to across ticks.
+//  3. the module its stack spends the most frames in, in brackets, for a thread
+//     whose origin is unrecoverable but whose current work is not;
+//  4. a synthetic label from the classified role, so a thread that gave up
+//     nothing at all is still something you can refer to across ticks.
 //
 // It never surfaces a bare hex address: without a module to anchor it, an
 // entry point is a number that identifies nothing.
@@ -48,6 +51,8 @@ func (r ThreadRow) Identity() string {
 		return r.Name
 	case r.Module != "":
 		return fmt.Sprintf("%s+0x%x", r.Module, r.ModuleOffset)
+	case r.Activity != "":
+		return "[" + r.Activity + "]"
 	case r.Role != "" && r.Role != "unknown" && r.Ordinal > 0:
 		return fmt.Sprintf("%s #%d", r.Role, r.Ordinal)
 	default:

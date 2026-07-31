@@ -3,12 +3,20 @@
 package governor
 
 import (
+	"ThreadOrchestra/config"
 	"ThreadOrchestra/process"
 	"ThreadOrchestra/thread"
 	"math"
 	"testing"
 	"time"
 )
+
+// testGates is the hysteresis half of the gate settings, which is all the
+// classifier reads. The safer-bucket factor is the shipped default, so these
+// tests still assert the asymmetry the governor actually runs with.
+func testGates(stableWindows int) config.Gates {
+	return config.Gates{StableWindows: stableWindows, SaferBucketFactor: 0.5}
+}
 
 // synthTick describes a constant per-tick behavior; buildSeries feeds it
 // through the real metrics pipeline so tests exercise update()/EMA/histogram
@@ -300,7 +308,7 @@ func TestClassifyAudioPump(t *testing.T) {
 	}
 
 	// The game marked it Time Critical, so it must be untouchable.
-	if b := BucketFor(role, f); b != BucketUntouchable {
+	if b := DefaultRoleBuckets().BucketFor(role, f); b != BucketUntouchable {
 		t.Fatalf("bucket = %v, want untouchable for game-set Time Critical", b)
 	}
 }
@@ -321,17 +329,18 @@ func TestVivoxOverridesTimeCritical(t *testing.T) {
 	s := buildSeries(synthTick{state: process.StateWaiting, wait: process.WrUserRequest, switchesPerTick: 100}, 10)
 	f := &Facts{Series: s, TimeCritical: true, Module: "vivoxsdk.dll"}
 
-	if b := BucketFor(RoleNetwork, f); b == BucketUntouchable {
+	policy := DefaultRoleBuckets()
+	if b := policy.BucketFor(RoleNetwork, f); b == BucketUntouchable {
 		t.Fatalf("vivox voice thread should be overridable, got untouchable")
-	} else if b != BucketInteractive {
-		t.Fatalf("bucket = %v, want interactive", b)
+	} else if b != policy.Of(RoleNetwork) {
+		t.Fatalf("bucket = %v, want the policy's network bucket %v", b, policy.Of(RoleNetwork))
 	}
 }
 
 func TestExcludeMakesUntouchable(t *testing.T) {
 	// An exclude match overrides everything, even a strong critical role.
 	f := &Facts{Excluded: true}
-	if b := BucketFor(RoleMainSim, f); b != BucketUntouchable {
+	if b := DefaultRoleBuckets().BucketFor(RoleMainSim, f); b != BucketUntouchable {
 		t.Fatalf("bucket = %v, want untouchable for excluded thread", b)
 	}
 }
@@ -339,7 +348,7 @@ func TestExcludeMakesUntouchable(t *testing.T) {
 func TestForceBucketOverridesTimeCritical(t *testing.T) {
 	// A force rule pins the bucket even against a game-set Time Critical thread.
 	f := &Facts{TimeCritical: true, ForcedBucket: BucketBackground}
-	if b := BucketFor(RoleAudio, f); b != BucketBackground {
+	if b := DefaultRoleBuckets().BucketFor(RoleAudio, f); b != BucketBackground {
 		t.Fatalf("bucket = %v, want background (force wins over time-critical)", b)
 	}
 }
@@ -354,7 +363,7 @@ func TestClassifyUnknownBeforeWarmup(t *testing.T) {
 }
 
 func TestHysteresisStabilizes(t *testing.T) {
-	c := NewClassifier(3)
+	c := NewClassifier(testGates(3), DefaultRoleBuckets())
 	key := thread.Key{TID: 1}
 	f := &Facts{
 		Series:      buildSeries(synthTick{state: process.StateWaiting, wait: process.WrQueue, cyclesPerTick: 2e8, switchesPerTick: 500}, 40),
@@ -381,7 +390,7 @@ func TestHysteresisStabilizes(t *testing.T) {
 // the role being reported. It used to rate the current window's winner, so a
 // row could show one role's name beside a different role's confidence.
 func TestConfidenceRatesTheReportedRole(t *testing.T) {
-	c := NewClassifier(3)
+	c := NewClassifier(testGates(3), DefaultRoleBuckets())
 	key := thread.Key{TID: 1}
 
 	worker := &Facts{
@@ -450,21 +459,19 @@ func TestRankIsDeterministic(t *testing.T) {
 // reset its streak every window and was therefore never actuated, even though
 // every window agreed on what to do with it.
 func TestBucketStabilizesDespiteRoleFlapping(t *testing.T) {
-	c := NewClassifier(3)
+	c := NewClassifier(testGates(3), DefaultRoleBuckets())
 	key := thread.Key{TID: 1}
 
-	// Two facts sets that classify differently but both land in critical: an
-	// audio pump and a foreground input thread.
-	pump := &Facts{
-		Series:      buildSeries(synthTick{state: process.StateWaiting, wait: process.WrUserRequest, cyclesPerTick: 1e6, switchesPerTick: 1000}, 40),
-		CyclesShare: 0.01,
-	}
-	input := &Facts{Series: pump.Series, CyclesShare: 0.01, IsForegroundInput: true}
+	// Two facts sets that classify differently but both land in critical: a
+	// foreground input thread and a GPU driver thread.
+	series := buildSeries(synthTick{state: process.StateWaiting, wait: process.WrUserRequest, switchesPerTick: 5}, 40)
+	input := &Facts{Series: series, CyclesShare: 0.01, IsForegroundInput: true}
+	driver := &Facts{Series: series, CyclesShare: 0.2, Module: "nvwgf2umx.dll"}
 
 	var v Verdict
 	for i := 0; i < 6; i++ {
 		if i%2 == 0 {
-			v = c.Observe(key, pump)
+			v = c.Observe(key, driver)
 		} else {
 			v = c.Observe(key, input)
 		}
@@ -481,7 +488,7 @@ func TestBucketStabilizesDespiteRoleFlapping(t *testing.T) {
 // Undoing a demotion must be cheaper than making one: the safer direction
 // commits in half the windows.
 func TestSaferBucketCommitsFaster(t *testing.T) {
-	c := NewClassifier(4)
+	c := NewClassifier(testGates(4), DefaultRoleBuckets())
 	key := thread.Key{TID: 1}
 
 	idle := &Facts{
@@ -509,7 +516,7 @@ func TestSaferBucketCommitsFaster(t *testing.T) {
 // inferences, so waiting out a stability streak before honouring "never touch
 // this thread" is exactly backwards.
 func TestOverridesCommitImmediately(t *testing.T) {
-	c := NewClassifier(5)
+	c := NewClassifier(testGates(5), DefaultRoleBuckets())
 	key := thread.Key{TID: 1}
 
 	s := buildSeries(synthTick{state: process.StateWaiting, wait: process.WrQueue, cyclesPerTick: 0, switchesPerTick: 10}, 40)
@@ -536,8 +543,8 @@ func TestBaselineIgnoresOurOwnPromotion(t *testing.T) {
 		t.Fatalf("BaselineRelative = %d, want 0: the baseline must not follow our own writes", s.BaselineRelative)
 	}
 
-	f := &Facts{TimeCritical: s.BaselineRelative >= gameElevatedPriority}
-	if b := BucketFor(RoleMainSim, f); b != BucketCritical {
+	f := &Facts{TimeCritical: s.BaselineRelative >= fallbackSignals.GameElevatedPriority}
+	if b := DefaultRoleBuckets().BucketFor(RoleMainSim, f); b != BucketCritical {
 		t.Fatalf("bucket = %v, want critical: a thread we promoted is not game-elevated", b)
 	}
 }
@@ -547,8 +554,8 @@ func TestBaselineHonoursGameElevation(t *testing.T) {
 	var s Series
 	s.noteBaseline(15, 13) // already at HIGHEST the first time we saw it
 
-	f := &Facts{TimeCritical: s.BaselineRelative >= gameElevatedPriority}
-	if b := BucketFor(RoleAudio, f); b != BucketUntouchable {
+	f := &Facts{TimeCritical: s.BaselineRelative >= fallbackSignals.GameElevatedPriority}
+	if b := DefaultRoleBuckets().BucketFor(RoleAudio, f); b != BucketUntouchable {
 		t.Fatalf("bucket = %v, want untouchable for a game-elevated thread", b)
 	}
 }

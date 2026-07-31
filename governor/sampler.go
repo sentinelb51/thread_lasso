@@ -14,10 +14,12 @@ import (
 // for the same tick.
 type ThreadSample struct {
 	process.ThreadSnapshot
-	Cycles      uint64 // cumulative; valid only when HasCycles
-	HasCycles   bool
-	Description string
-	Entry       *thread.Entry
+	Cycles       uint64 // cumulative; valid only when HasCycles
+	HasCycles    bool
+	IoPending    bool // an I/O request was outstanding; valid only when HasIoPending
+	HasIoPending bool
+	Description  string
+	Entry        *thread.Entry
 }
 
 // Sample is everything measured in one poll tick.
@@ -81,6 +83,15 @@ func (s *Sampler) Sample() (Sample, error) {
 			if cycles, err := process.ThreadCycles(entries[i].Handle); err == nil {
 				threadSample.Cycles = cycles
 				threadSample.HasCycles = true
+			}
+		}
+		// The only per-thread I/O signal Windows offers. One syscall per thread
+		// per tick, and the sole way to tell a thread waiting on a socket from
+		// one waiting on a lock.
+		if entries[i].Handle != 0 && entries[i].Capabilities.QueryIoPending {
+			if pending, err := process.ThreadIoPending(entries[i].Handle); err == nil {
+				threadSample.IoPending = pending
+				threadSample.HasIoPending = true
 			}
 		}
 

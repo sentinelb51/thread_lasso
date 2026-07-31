@@ -159,6 +159,15 @@ type ThreadSnapshot struct {
 // process it never legitimately does.
 const kernelSpaceFloor = uintptr(0xFFFF800000000000)
 
+// UserAddress reports whether addr could be a code address in this process.
+// Every recovery path funnels through it, because each one has its own way of
+// returning something that is not an address: the snapshot returns 0 for a
+// scrubbed field and a kernel routine for a system thread, and a stack sweep
+// returns whatever happened to be lying on the stack.
+func UserAddress(addr uintptr) bool {
+	return addr != 0 && addr < kernelSpaceFloor
+}
+
 // EntryPoint is the thread's start routine, preferring the value a debugger
 // would show and falling back to the one user mode cannot rewrite.
 //
@@ -172,10 +181,10 @@ const kernelSpaceFloor = uintptr(0xFFFF800000000000)
 // Returns 0 when neither field is a usable user-mode address; callers must
 // treat 0 as "unknown" and never group threads by it.
 func (t *ThreadSnapshot) EntryPoint() uintptr {
-	if t.Win32StartAddress != 0 && t.Win32StartAddress < kernelSpaceFloor {
+	if UserAddress(t.Win32StartAddress) {
 		return t.Win32StartAddress
 	}
-	if t.StartAddress != 0 && t.StartAddress < kernelSpaceFloor {
+	if UserAddress(t.StartAddress) {
 		return t.StartAddress
 	}
 	return 0

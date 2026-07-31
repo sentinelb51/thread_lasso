@@ -47,6 +47,8 @@ type Capabilities struct {
 	SetIdealCpu       bool // THREAD_SET_INFORMATION
 	QueryCycles       bool // THREAD_QUERY_LIMITED_INFORMATION
 	QueryDescription  bool // THREAD_QUERY_LIMITED_INFORMATION
+	QueryStartAddress bool // THREAD_QUERY_INFORMATION
+	QueryIoPending    bool // THREAD_QUERY_INFORMATION
 }
 
 // CapabilitiesFor maps granted thread access rights to usable tunables.
@@ -54,6 +56,7 @@ func CapabilitiesFor(grantedAccess uint32) Capabilities {
 	queryLimited := grantedAccess&(ThreadQueryLimitedInformation|ThreadQueryInformation) != 0
 	setLimited := grantedAccess&(ThreadSetLimitedInformation|ThreadSetInformation) != 0
 	setFull := grantedAccess&ThreadSetInformation != 0
+	queryFull := grantedAccess&ThreadQueryInformation != 0
 
 	return Capabilities{
 		SetPriority:       setLimited,
@@ -64,5 +67,7 @@ func CapabilitiesFor(grantedAccess uint32) Capabilities {
 		SetIdealCpu:       setFull,
 		QueryCycles:       queryLimited,
 		QueryDescription:  queryLimited,
+		QueryStartAddress: queryFull,
+		QueryIoPending:    queryFull,
 	}
 }

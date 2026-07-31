@@ -3,61 +3,36 @@
 package governor
 
 import (
-	"ThreadOrchestra/thread"
 	"sort"
 	"strings"
 	"time"
+
+	"ThreadOrchestra/config"
+	"ThreadOrchestra/thread"
 )
 
-// aggression is the parsed form of the "aggression" config knob.
-type aggression int
-
-const (
-	aggConservative aggression = iota // raise-only: promote, never demote
-	aggStandard                       // + demote high-confidence Telemetry/PoolIdle
-	aggAggressive                     // full bucket policy
-)
-
-func parseAggression(s string) aggression {
-	switch s {
-	case "conservative":
-		return aggConservative
-	case "aggressive":
-		return aggAggressive
-	default:
-		return aggStandard
-	}
-}
-
-// THREAD_PRIORITY_* relative values and the knobs the actuator writes.
-const (
-	priorityNormal = 0 // THREAD_PRIORITY_NORMAL
-
-	ioPriorityLow  = 1 // Low
-	ioPriorityHigh = 3 // High
-
-	// MEMORY_PRIORITY_MEDIUM — demotes a background thread's pages ahead of
-	// the game's without starving it outright (plan §Policy).
-	backgroundMemoryPriority uint32 = 3
-
-	// Demotions require more evidence than promotions.
-	demoteMinConfidence = 0.5
-
-	// Sustained fraction of polls a thread is seen Ready (runnable but not
-	// running) that marks it CPU-starved — a demotion we must undo.
-	starvationReadyRatio = 0.25
-)
+// The actuator no longer decides what a bucket does — config.Tuning does. What
+// stays here is the part that cannot be expressed as a table: the order threads
+// are tuned in, which physical core each one gets, when settings are undone, and
+// the watchdog that rolls back a demotion that turned out to be load-bearing.
 
 // actionState tracks what the governor has done to one thread, for cooldown,
 // watchdog rollback, and the UI's "applied" column.
 type actionState struct {
-	lastChange  time.Time
-	label       string
-	bucket      Bucket // what the current settings were applied *for*
-	idealCPU    int    // sticky: the physical core this thread was steered onto
-	idealSlot   int    // index of that core in the topology's lead list
-	hasIdeal    bool
-	demoted     bool // we lowered this thread; the watchdog may roll it back
+	lastChange time.Time
+	label      string
+	bucket     Bucket // what the current settings were applied *for*
+	generation uint64 // the tuning revision they were applied under
+	idealCPU   int    // sticky: the physical core this thread was steered onto
+	idealSlot  int    // index of that core in the topology's lead list
+	hasIdeal   bool
+
+	// lowered marks a thread whose priority, memory priority, I/O priority or
+	// core set we reduced. It is what the watchdog watches, and it covers every
+	// kind of holding-back rather than priority alone: a thread throttled into a
+	// stall is starved however it got there, and now that any bucket can be
+	// configured to lower things, "background" is no longer the right test.
+	lowered     bool
 	quarantined bool // rolled back after starvation — never touched again
 }
 
@@ -87,19 +62,15 @@ func bucketImportance(b Bucket) int {
 	}
 }
 
-// Actuator turns per-thread verdicts into thread modifications, filtered by
-// aggression level and the handle's real capabilities, and owns the rollback
+// Actuator turns per-thread verdicts into thread modifications, filtered by the
+// configured gates and the handle's real capabilities, and owns the rollback
 // watchdog. It never touches a thread in observe mode (governor never calls
 // Apply then); Watchdog and AppliedLabel stay safe no-ops in that case.
 type Actuator struct {
-	governor         *Governor
-	aggression       aggression
-	cooldown         time.Duration
-	promotionCeiling int
-	demotionFloor    int
-	coreLoad         []int // threads currently steered onto each physical-core lead
-	states           map[thread.Key]*actionState
-	pending          []pendingAction // reused across ticks to keep Apply allocation-free
+	governor *Governor
+	coreLoad []int // threads currently steered onto each physical-core lead
+	states   map[thread.Key]*actionState
+	pending  []pendingAction // reused across ticks to keep Apply allocation-free
 }
 
 // pendingAction is one thread's actuation, queued so the tick can be ordered by
@@ -112,22 +83,9 @@ type pendingAction struct {
 }
 
 func NewActuator(g *Governor) *Actuator {
-	ceiling := 2
-	if g.auto.PromotionCeiling != nil {
-		ceiling = *g.auto.PromotionCeiling
-	}
-	floor := -1
-	if g.auto.DemotionFloor != nil {
-		floor = *g.auto.DemotionFloor
-	}
-
 	return &Actuator{
-		governor:         g,
-		aggression:       parseAggression(g.auto.Aggression),
-		cooldown:         time.Duration(g.auto.CooldownMS) * time.Millisecond,
-		promotionCeiling: ceiling,
-		demotionFloor:    floor,
-		states:           make(map[thread.Key]*actionState),
+		governor: g,
+		states:   make(map[thread.Key]*actionState),
 	}
 }
 
@@ -176,13 +134,14 @@ func (a *Actuator) Apply(sample *Sample, facts map[thread.Key]*Facts, verdicts m
 		return left.facts.CyclesShare > right.facts.CyclesShare
 	})
 
+	tuning, generation := a.governor.Tuning()
 	for i := range a.pending {
 		action := &a.pending[i]
-		a.applyOne(action.key, action.entry, action.verdict, action.facts)
+		a.applyOne(action.key, action.entry, action.verdict, tuning, generation)
 	}
 }
 
-func (a *Actuator) applyOne(key thread.Key, entry *thread.Entry, verdict Verdict, f *Facts) {
+func (a *Actuator) applyOne(key thread.Key, entry *thread.Entry, verdict Verdict, tuning *config.Tuning, generation uint64) {
 	// Manual rules win outright: never fight a thread the user has pinned.
 	if a.governor.manual.Owns(key) {
 		return
@@ -193,127 +152,65 @@ func (a *Actuator) applyOne(key thread.Key, entry *thread.Entry, verdict Verdict
 		return
 	}
 
-	// The classification that motivated the current settings no longer holds,
-	// so undo them — before the cooldown check, because leaving a thread tuned
-	// for a bucket it is no longer in is the thing we are fixing. Previously
-	// state.bucket was recorded and never read, so a thread misclassified once
-	// (typically during loading, when the hot set looks nothing like gameplay)
-	// kept those settings for the rest of the session; only the starvation
-	// watchdog could ever undo anything.
-	if state.bucket != BucketNone && state.bucket != verdict.Bucket {
+	// The settings on this thread no longer match what it should have, so undo
+	// them before doing anything else. Two things can invalidate them: the
+	// classification moved, or the user edited the tuning table underneath us.
+	// Leaving a thread tuned for a bucket it is no longer in is the failure this
+	// guards against — state.bucket used to be recorded and never read, so a
+	// thread misclassified once during loading kept those settings for the whole
+	// session and only the starvation watchdog could ever undo anything.
+	if state.bucket != BucketNone && (state.bucket != verdict.Bucket || state.generation != generation) {
+		retuned := state.generation != generation
 		tuned := entry.Touched()
 		if err := entry.Restore(); err != nil {
 			return // journal intact; try again next tick
 		}
 
 		state.bucket = BucketNone
-		state.demoted = false
+		state.lowered = false
 		a.releaseCore(state)
 
-		if tuned {
-			// Re-tune for the new bucket only after a cooldown, so a flapping
-			// classification cannot drive a burst of changes.
+		// A flapping classification must not drive a burst of changes, so a
+		// bucket move costs a cooldown before the thread is tuned again. A
+		// settings edit is a deliberate act by someone watching the window, and
+		// making them wait out a 30-second cooldown to see the effect would read
+		// as the control not working.
+		if tuned && !retuned {
 			state.label = "reverted"
 			state.lastChange = time.Now()
 			return
 		}
-		// Nothing had actually been applied; fall through and tune normally.
 	}
 
-	if !state.lastChange.IsZero() && time.Since(state.lastChange) < a.cooldown {
+	if !state.lastChange.IsZero() && time.Since(state.lastChange) < time.Duration(tuning.Gates.CooldownMS)*time.Millisecond {
 		return
 	}
 
-	var applied []string
-	demoted := false
-
-	switch verdict.Bucket {
-	case BucketCritical:
-		if ok, _ := entry.RaisePriorityTo(a.promotionCeiling); ok {
-			applied = append(applied, "prio↑")
-		}
-		if len(a.governor.auto.CriticalCores) > 0 {
-			if ok, _ := entry.ApplyCpuSets(a.governor.auto.CriticalCores); ok {
-				applied = append(applied, "cpuset")
-			}
-		}
-		// Steer each critical thread onto a distinct physical core so the
-		// frame-critical set does not pile onto SMT siblings (full mode only).
-		// Assigned once and remembered: the round-robin cursor used to advance
-		// on every re-apply, so a thread that stayed critical was moved to a
-		// different core every cooldown, throwing away its cache warmth.
-		if cpu, has := a.idealCoreFor(state); has {
-			if ok, _ := entry.ApplyIdealProcessor(cpu); ok {
-				applied = append(applied, "ideal")
-			}
-		}
-		if a.aggression == aggAggressive {
-			if ok, _ := entry.ApplyIoPriority(ioPriorityHigh); ok {
-				applied = append(applied, "io↑")
-			}
-		}
-
-	case BucketInteractive:
-		// Only guarantee it is not stuck below Normal; never demote.
-		if ok, _ := entry.RaisePriorityTo(priorityNormal); ok {
-			applied = append(applied, "prio=norm")
-		}
-
-	case BucketBackground:
-		if a.aggression == aggConservative {
-			return // raise-only mode never demotes
-		}
-		// Demotions require more evidence than promotions at every level: a
-		// wrongly demoted thread costs frames for as long as it stays demoted,
-		// while a wrongly untouched one costs nothing. Aggressive used to skip
-		// this check entirely, so the most invasive mode was also the one acting
-		// on the weakest evidence.
-		if verdict.Confidence < demoteMinConfidence {
-			return
-		}
-		if a.aggression == aggStandard {
-			// Standard demotes only the two roles we are most sure are junk.
-			if verdict.Role != RoleTelemetry && verdict.Role != RolePoolIdle {
-				return
-			}
-		}
-
-		if ok, _ := entry.LowerPriorityTo(a.demotionFloor); ok {
-			applied = append(applied, "prio↓")
-			demoted = true
-		}
-
-		if a.aggression == aggAggressive {
-			if ok, _ := entry.ApplyMemoryPriority(backgroundMemoryPriority); ok {
-				applied = append(applied, "mem↓")
-			}
-			// I/O throttling is safe for telemetry but not for asset loaders,
-			// which must stream at full speed even when classified background.
-			if verdict.Role == RoleTelemetry {
-				if ok, _ := entry.ApplyIoPriority(ioPriorityLow); ok {
-					applied = append(applied, "io↓")
-				}
-				if ok, _ := entry.ApplyEcoQoS(); ok {
-					applied = append(applied, "eco")
-				}
-			}
-			if len(a.governor.auto.BackgroundCores) > 0 {
-				if ok, _ := entry.ApplyCpuSets(a.governor.auto.BackgroundCores); ok {
-					applied = append(applied, "cpuset")
-				}
-			}
-		}
-
-	default:
+	action, ok := tuning.ActionFor(verdict.Bucket.String(), verdict.Role.String())
+	if !ok {
 		return // BucketNone / BucketUntouchable — leave the thread alone
 	}
 
+	// Demotions require more evidence than promotions, at every level: a wrongly
+	// held-back thread costs frames for as long as it stays that way, while a
+	// wrongly untouched one costs nothing.
+	lowers := action.Lowers()
+	if lowers {
+		if verdict.Confidence < tuning.Gates.DemoteMinConfidence {
+			return
+		}
+		if !tuning.Gates.Demotable(verdict.Role.String()) {
+			return
+		}
+	}
+
+	applied := a.enact(entry, state, action)
 	if len(applied) == 0 {
 		// Nothing needed changing — the thread already matches its bucket.
 		// Record the bucket anyway so the reclassification check above can see
 		// it later, and start the cooldown so we stop re-probing every tick.
 		if state.bucket == BucketNone {
-			state.bucket = verdict.Bucket
+			state.bucket, state.generation = verdict.Bucket, generation
 			state.lastChange = time.Now()
 		}
 		return
@@ -321,10 +218,103 @@ func (a *Actuator) applyOne(key thread.Key, entry *thread.Entry, verdict Verdict
 
 	state.lastChange = time.Now()
 	state.label = strings.Join(applied, ",")
-	state.bucket = verdict.Bucket
-	if demoted {
-		state.demoted = true
+	state.bucket, state.generation = verdict.Bucket, generation
+	if lowers {
+		state.lowered = true
 	}
+}
+
+// enact writes one resolved action to a thread and returns a short label for
+// each field it actually changed. Every field is independent: one that cannot be
+// applied — no capability, no configured core list — is skipped without
+// affecting the others.
+func (a *Actuator) enact(entry *thread.Entry, state *actionState, action config.BucketAction) []string {
+	var applied []string
+
+	switch action.PriorityMode {
+	case config.PriorityRaise:
+		if ok, _ := entry.RaisePriorityTo(action.Priority); ok {
+			applied = append(applied, "prio↑")
+		}
+	case config.PriorityLower:
+		if ok, _ := entry.LowerPriorityTo(action.Priority); ok {
+			applied = append(applied, "prio↓")
+		}
+	case config.PrioritySet:
+		if ok, _ := entry.SetPriorityTo(action.Priority); ok {
+			applied = append(applied, "prio=")
+		}
+	}
+
+	if cores := a.coresFor(action.CPUSets); len(cores) > 0 {
+		if ok, _ := entry.ApplyCpuSets(cores); ok {
+			applied = append(applied, "cpuset")
+		}
+	}
+
+	// Steer the thread onto a distinct physical core so a frame-critical set does
+	// not pile onto SMT siblings (full mode only). Assigned once and remembered:
+	// the round-robin cursor this replaced advanced on every re-apply, so a
+	// thread that stayed critical was moved to a different core every cooldown,
+	// throwing away its cache warmth.
+	if action.IdealCore {
+		if cpu, has := a.idealCoreFor(state); has {
+			if ok, _ := entry.ApplyIdealProcessor(cpu); ok {
+				applied = append(applied, "ideal")
+			}
+		}
+	}
+
+	if priority, wanted := config.IoPriorityValue(action.IOPriority); wanted {
+		if ok, _ := entry.ApplyIoPriority(priority); ok {
+			applied = append(applied, "io"+arrow(priority, ioPriorityNormal))
+		}
+	}
+
+	if action.MemoryPriority > 0 {
+		if ok, _ := entry.ApplyMemoryPriority(uint32(action.MemoryPriority)); ok {
+			applied = append(applied, "mem"+arrow(action.MemoryPriority, memoryPriorityNormal))
+		}
+	}
+
+	if action.EcoQoS {
+		if ok, _ := entry.ApplyEcoQoS(); ok {
+			applied = append(applied, "eco")
+		}
+	}
+
+	return applied
+}
+
+// The neutral points the applied labels are drawn against, so a glance at the
+// column says which direction a thread was moved.
+const (
+	ioPriorityNormal     = 2
+	memoryPriorityNormal = 5
+)
+
+func arrow(value, neutral int) string {
+	switch {
+	case value > neutral:
+		return "↑"
+	case value < neutral:
+		return "↓"
+	default:
+		return "="
+	}
+}
+
+// coresFor resolves a cpu_sets selection to the game's configured core list.
+// An unconfigured list yields nothing, which skips the action.
+func (a *Actuator) coresFor(selection string) []int {
+	switch selection {
+	case config.CpuSetsCritical:
+		return a.governor.auto.CriticalCores
+	case config.CpuSetsBackground:
+		return a.governor.auto.BackgroundCores
+	}
+
+	return nil
 }
 
 // idealCoreFor returns the physical core this thread should be steered onto,
@@ -379,17 +369,20 @@ func (a *Actuator) releaseCore(state *actionState) {
 	}
 }
 
-// Watchdog rolls back any demoted thread that is now CPU-starved: a background
+// Watchdog rolls back any thread we held back that is now CPU-starved: a
 // classification that turned out to be load-bearing. The thread is fully
-// reverted and quarantined so the governor stops fighting the scheduler.
+// reverted, and by default quarantined so the governor stops fighting the
+// scheduler over it.
 func (a *Actuator) Watchdog(facts map[thread.Key]*Facts) {
+	tuning, _ := a.governor.Tuning()
+
 	for key, state := range a.states {
-		if !state.demoted || state.quarantined {
+		if !state.lowered || state.quarantined {
 			continue
 		}
 
 		f := facts[key]
-		if f == nil || f.Series.ReadyRatio <= starvationReadyRatio {
+		if f == nil || f.Series.ReadyRatio <= tuning.Gates.StarvationReadyRatio {
 			continue
 		}
 
@@ -401,10 +394,19 @@ func (a *Actuator) Watchdog(facts map[thread.Key]*Facts) {
 			continue // keep trying next tick
 		}
 
-		state.demoted = false
-		state.quarantined = true
-		state.label = "rolled-back"
+		state.lowered = false
+		state.bucket = BucketNone
 		a.releaseCore(state)
+
+		if tuning.Gates.QuarantineOnRollback {
+			state.quarantined = true
+			state.label = "rolled-back"
+			continue
+		}
+		// Not quarantined: the thread is eligible again, but only after a
+		// cooldown, or the next tick would simply redo what just starved it.
+		state.label = "rolled-back*"
+		state.lastChange = time.Now()
 	}
 }
 
